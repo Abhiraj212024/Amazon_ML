@@ -1,0 +1,40 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data folders (ignore all large datasets and processed files)
+data/raw/*
+data/processed/*
+dataset/
+*.tsv
+*.csv
+*.parquet
+
+# Reports
+reports/*.json
+reports/*.html
+reports/*.csv
+!reports/.gitkeep
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs
+logs/
+*.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
