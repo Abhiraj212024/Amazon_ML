@@ -1,0 +1,309 @@
+"""
+End-to-end matching pipeline: blocking -> pairwise model -> conflict resolution
+-> set selection, scored with the official macro F0.5.
+
+Runs an ablation over the decision strategy and the conflict-resolution stage,
+so the value of each filtering layer is visible rather than assumed.
+
+    python3 scripts/run_matching.py --train-dir dataset/train
+    python3 scripts/run_matching.py --train-dir dataset/train \
+        --test-dir dataset/test --output-dir output
+"""
+import argparse
+import json
+import logging
+import os
+import sys
+import time
+
+import pandas as pd
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from src.matching import io as match_io
+from src.matching import metrics, resolve, splits
+from src.matching.blocking import channel_contribution, generate_candidates
+from src.matching.decide import select_matches, tune_threshold
+from src.matching.model import PairwiseMatcher, label_pairs
+from src.matching.pair_features import build_idf, build_pair_table, build_record_views
+from src.preprocessing.pipeline import preprocess_dataframe
+
+logger = logging.getLogger("run_matching")
+
+
+def _load_sources(data_dir, prefix):
+    frames = {}
+    for source in ("source1", "source2", "source3"):
+        path = os.path.join(data_dir, f"{prefix}_{source}.tsv")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"expected {path}")
+        frames[source] = preprocess_dataframe(pd.read_csv(path, sep="\t", dtype=str))
+    pool = pd.concat([frames["source2"], frames["source3"]], ignore_index=True)
+    return frames["source1"], pool
+
+
+def _tokens(df, column):
+    if column not in df.columns:
+        return []
+    return [t.split() for t in df[column].fillna("").astype(str)]
+
+
+def _score_pairs(matcher, candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids):
+    """Featurise and score, returning dict s1_id -> [(candidate_id, prob), ...]."""
+    subset = {sid: candidates.get(sid, {}) for sid in s1_ids}
+    X, pair_index = build_pair_table(subset, s1_views, pool_views, name_idf, addr_idf)
+
+    scored = {sid: [] for sid in s1_ids}
+    if len(X) == 0:
+        return scored, X, pair_index
+
+    probs = matcher.predict_proba(X)
+    for s1_id, cand_id, prob in zip(
+        pair_index["s1_entity_id"], pair_index["candidate_entity_id"], probs
+    ):
+        scored[s1_id].append((cand_id, float(prob)))
+    return scored, X, pair_index
+
+
+def _evaluate(scored, candidates, ground_truth, country_of, strategy, conflict_stage,
+              strategy_kwargs=None):
+    """Apply one (strategy, conflict_stage) combination and score it."""
+    strategy_kwargs = strategy_kwargs or {}
+    working = scored
+    conflict_report = None
+
+    if conflict_stage == "pre":
+        working, conflict_report = resolve.resolve_scored_pairs(working)
+
+    predictions = select_matches(working, strategy, **strategy_kwargs)
+
+    if conflict_stage == "post":
+        predictions, conflict_report = resolve.resolve_predictions(predictions, working)
+
+    score, per_entity = metrics.macro_f05(predictions, ground_truth)
+    return {
+        "strategy": strategy,
+        "conflict_stage": conflict_stage,
+        "macro_f05": score,
+        "conflict_report": conflict_report,
+        "errors": metrics.error_attribution(predictions, candidates, ground_truth),
+        "slices": metrics.slice_report(per_entity, ground_truth, country_of),
+    }, predictions
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--train-dir", required=True)
+    parser.add_argument("--test-dir", default=None,
+                        help="when given, also predict the test set and write submission files")
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--report-file", default="reports/matching_report.json")
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--tune-fraction", type=float, default=0.25,
+                        help="share of the training entities reserved for tuning thresholds")
+    parser.add_argument("--holdout-country", default=None,
+                        help="validate on this country only, as a proxy for the unseen test country")
+    parser.add_argument("--strategy", default="expected_f05",
+                        choices=("expected_f05", "threshold", "top1"))
+    parser.add_argument("--conflict-stage", default="post", choices=("none", "pre", "post"))
+    parser.add_argument("--no-ablation", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    started = time.time()
+    report = {}
+
+    logger.info("loading and preprocessing training data")
+    s1_df, pool_df = _load_sources(args.train_dir, "train")
+    ground_truth = match_io.load_ground_truth(
+        os.path.join(args.train_dir, "train_ground_truth.tsv")
+    )
+    country_of = dict(zip(s1_df["entity_id"], s1_df["country_clean"].fillna("UNKNOWN")))
+
+    # --- assumption check that gates conflict resolution -------------------
+    one_to_one = resolve.check_one_to_one(ground_truth)
+    report["one_to_one_check"] = one_to_one
+    logger.info(
+        "one-to-one check: %d/%d matched records claimed by >1 S1 entity (holds=%s)",
+        one_to_one["n_shared_records"], one_to_one["n_matched_records"], one_to_one["holds"],
+    )
+    conflict_stage = args.conflict_stage
+    if not one_to_one["holds"] and conflict_stage != "none":
+        logger.warning(
+            "ground truth violates the one-to-one assumption (rate %.4f); "
+            "conflict resolution disabled",
+            one_to_one["violation_rate"],
+        )
+        conflict_stage = "none"
+
+    # --- the floor every model has to beat ---------------------------------
+    report["all_empty_baseline"] = metrics.all_empty_baseline(ground_truth)
+    logger.info("all-empty baseline (singleton fraction) = %.4f", report["all_empty_baseline"])
+
+    # --- split by entity, keeping the full pool for validation -------------
+    s1_ids = s1_df["entity_id"].tolist()
+    if args.holdout_country:
+        train_ids, val_ids = splits.leave_one_country_out(
+            s1_ids, country_of, args.holdout_country
+        )
+    else:
+        train_ids, val_ids = splits.holdout_split(
+            s1_ids, ground_truth, country_of, args.val_fraction, args.seed
+        )
+    # Thresholds are hyperparameters: tuning them on the validation slice and
+    # then reporting on it inflates the score. Carve a separate tuning slice out
+    # of the training entities instead, so validation stays untouched.
+    fit_ids, tune_ids = splits.holdout_split(
+        train_ids, ground_truth, country_of, args.tune_fraction, args.seed + 1
+    )
+    report["split"] = splits.split_summary(fit_ids, val_ids, ground_truth, country_of)
+    report["split"]["tune"] = {"n_entities": len(tune_ids)}
+    logger.info(
+        "split: %d fit / %d tune / %d val entities", len(fit_ids), len(tune_ids), len(val_ids)
+    )
+
+    # --- stage A: blocking -------------------------------------------------
+    logger.info("generating candidates")
+    t0 = time.time()
+    candidates = generate_candidates(s1_df, pool_df)
+    report["blocking_seconds"] = time.time() - t0
+
+    val_gt = {sid: ground_truth.get(sid, set()) for sid in val_ids}
+    report["blocking"] = metrics.blocking_report(candidates, val_gt, len(pool_df))
+    report["blocking_channels"] = channel_contribution(candidates, val_gt)
+    logger.info(
+        "blocking: pair recall %.4f | %.1f candidates/entity | reduction %.5f",
+        report["blocking"]["pair_recall"],
+        report["blocking"]["candidates_per_entity_mean"],
+        report["blocking"]["reduction_ratio"],
+    )
+
+    # --- stage B: pairwise model ------------------------------------------
+    s1_views, pool_views = build_record_views(s1_df), build_record_views(pool_df)
+    name_column = "business_name_core" if "business_name_core" in s1_df.columns else "business_name_clean"
+    name_idf = build_idf(_tokens(s1_df, name_column), _tokens(pool_df, name_column))
+    addr_idf = build_idf(
+        _tokens(s1_df, "business_address_clean"), _tokens(pool_df, "business_address_clean")
+    )
+
+    logger.info("featurising training pairs")
+    train_subset = {sid: candidates.get(sid, {}) for sid in fit_ids}
+    X_train, train_index = build_pair_table(train_subset, s1_views, pool_views, name_idf, addr_idf)
+    y_train = label_pairs(train_index, ground_truth)
+    logger.info("train pairs: %d (%d positive)", len(y_train), int(y_train.sum()))
+
+    matcher = PairwiseMatcher(random_state=args.seed).fit(
+        X_train, y_train, train_index["s1_entity_id"].to_numpy(dtype=object)
+    )
+    report["feature_importance"] = dict(
+        list(matcher.feature_importance(X_train, y_train).items())[:15]
+    )
+
+    logger.info("scoring tuning and validation pairs")
+    tune_scored, _, _ = _score_pairs(
+        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, tune_ids
+    )
+    val_scored, _, _ = _score_pairs(
+        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, val_ids
+    )
+
+    # --- stages C and D: ablation -----------------------------------------
+    tune_gt = {sid: ground_truth.get(sid, set()) for sid in tune_ids}
+    tuned = tune_threshold(tune_scored, tune_gt)
+    report["tuned_threshold"] = tuned
+    logger.info("tuned threshold strategy: %s", tuned)
+
+    combos = (
+        [(args.strategy, conflict_stage)]
+        if args.no_ablation
+        else [(s, c) for s in ("top1", "threshold", "expected_f05")
+              for c in (["none"] if conflict_stage == "none" else ["none", "pre", "post"])]
+    )
+
+    ablation, chosen_predictions = [], None
+    for strategy, stage in combos:
+        kwargs = {"t_high": tuned["t_high"], "ratio": tuned["ratio"]} if strategy == "threshold" else {}
+        if strategy == "top1":
+            kwargs = {"t_high": tuned["t_high"]}
+        result, predictions = _evaluate(
+            val_scored, candidates, val_gt, country_of, strategy, stage, kwargs
+        )
+        ablation.append(result)
+        logger.info(
+            "  %-13s conflict=%-4s -> macro F0.5 = %.4f",
+            strategy, stage, result["macro_f05"],
+        )
+        if (strategy, stage) == (args.strategy, conflict_stage):
+            chosen_predictions = predictions
+
+    report["ablation"] = ablation
+    best = max(ablation, key=lambda r: r["macro_f05"])
+    report["best_validation"] = {
+        "strategy": best["strategy"],
+        "conflict_stage": best["conflict_stage"],
+        "macro_f05": best["macro_f05"],
+    }
+    report["selected_validation"] = {
+        "strategy": args.strategy,
+        "conflict_stage": conflict_stage,
+        "macro_f05": next(
+            r["macro_f05"] for r in ablation
+            if r["strategy"] == args.strategy and r["conflict_stage"] == conflict_stage
+        ),
+    }
+
+    # --- test set prediction -----------------------------------------------
+    if args.test_dir:
+        logger.info("predicting the test set")
+        test_s1, test_pool = _load_sources(args.test_dir, "test")
+        test_candidates = generate_candidates(test_s1, test_pool)
+
+        test_s1_views, test_pool_views = build_record_views(test_s1), build_record_views(test_pool)
+        test_ids = test_s1["entity_id"].tolist()
+        test_scored, _, _ = _score_pairs(
+            matcher, test_candidates, test_s1_views, test_pool_views,
+            name_idf, addr_idf, test_ids,
+        )
+
+        working = test_scored
+        if conflict_stage == "pre":
+            working, _ = resolve.resolve_scored_pairs(working)
+        kwargs = {"t_high": tuned["t_high"], "ratio": tuned["ratio"]} if args.strategy == "threshold" else {}
+        if args.strategy == "top1":
+            kwargs = {"t_high": tuned["t_high"]}
+        test_predictions = select_matches(working, args.strategy, **kwargs)
+        if conflict_stage == "post":
+            test_predictions, _ = resolve.resolve_predictions(test_predictions, working)
+
+        match_io.write_matching_results(
+            os.path.join(args.output_dir, "matching_results.tsv"), test_ids, test_predictions
+        )
+        match_io.write_candidate_pairs(
+            os.path.join(args.output_dir, "candidate_pairs.tsv"), test_ids, test_candidates
+        )
+        report["test"] = {
+            "n_entities": len(test_ids),
+            "n_predicted_ids": sum(len(v) for v in test_predictions.values()),
+            "predicted_singleton_rate": sum(1 for v in test_predictions.values() if not v) / max(len(test_ids), 1),
+            "countries": sorted(set(test_s1["country_clean"].fillna("UNKNOWN"))),
+        }
+        logger.info("wrote submission files to %s/", args.output_dir)
+
+    report["total_seconds"] = time.time() - started
+    os.makedirs(os.path.dirname(os.path.abspath(args.report_file)), exist_ok=True)
+    with open(args.report_file, "w") as handle:
+        json.dump(report, handle, indent=2, default=str)
+    logger.info("report written to %s", args.report_file)
+
+    print("\n=== summary " + "=" * 48)
+    print(f"all-empty baseline (must beat) : {report['all_empty_baseline']:.4f}")
+    print(f"blocking pair recall           : {report['blocking']['pair_recall']:.4f}")
+    print(f"candidates / entity (mean)     : {report['blocking']['candidates_per_entity_mean']:.1f}")
+    print(f"best validation macro F0.5     : {best['macro_f05']:.4f} "
+          f"({best['strategy']}, conflict={best['conflict_stage']})")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
