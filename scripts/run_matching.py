@@ -32,12 +32,27 @@ logger = logging.getLogger("run_matching")
 
 
 def _load_sources(data_dir, prefix):
+    processed_paths = {
+        source: os.path.join(data_dir, f"{prefix}_{source}_processed.parquet")
+        for source in ("source1", "source2", "source3")
+    }
+    processed_exists = [os.path.exists(path) for path in processed_paths.values()]
+    use_processed = all(processed_exists)
+    if any(processed_exists) and not use_processed:
+        missing = [path for path, exists in zip(processed_paths.values(), processed_exists) if not exists]
+        raise FileNotFoundError(f"processed dataset is incomplete; missing {missing}")
+
     frames = {}
     for source in ("source1", "source2", "source3"):
-        path = os.path.join(data_dir, f"{prefix}_{source}.tsv")
+        path = processed_paths[source] if use_processed else os.path.join(
+            data_dir, f"{prefix}_{source}.tsv"
+        )
         if not os.path.exists(path):
-            raise FileNotFoundError(f"expected {path}")
-        frames[source] = preprocess_dataframe(pd.read_csv(path, sep="\t", dtype=str))
+            raise FileNotFoundError(f"expected raw TSV file; missing {path}")
+        if use_processed:
+            frames[source] = pd.read_parquet(path)
+        else:
+            frames[source] = preprocess_dataframe(pd.read_csv(path, sep="\t", dtype=str))
     pool = pd.concat([frames["source2"], frames["source3"]], ignore_index=True)
     return frames["source1"], pool
 
@@ -96,6 +111,8 @@ def main():
     parser.add_argument("--train-dir", required=True)
     parser.add_argument("--test-dir", default=None,
                         help="when given, also predict the test set and write submission files")
+    parser.add_argument("--ground-truth", default=None,
+                        help="path to train_ground_truth.tsv (defaults to --train-dir/train_ground_truth.tsv)")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--report-file", default="reports/matching_report.json")
     parser.add_argument("--val-fraction", type=float, default=0.2)
@@ -114,10 +131,13 @@ def main():
     started = time.time()
     report = {}
 
-    logger.info("loading and preprocessing training data")
+    logger.info("loading training data")
     s1_df, pool_df = _load_sources(args.train_dir, "train")
-    ground_truth = match_io.load_ground_truth(
-        os.path.join(args.train_dir, "train_ground_truth.tsv")
+    ground_truth_path = args.ground_truth or os.path.join(args.train_dir, "train_ground_truth.tsv")
+    ground_truth = match_io.load_ground_truth(ground_truth_path)
+    logger.info(
+        "training data loaded | source1=%d pool=%d labels=%d",
+        len(s1_df), len(pool_df), len(ground_truth),
     )
     country_of = dict(zip(s1_df["entity_id"], s1_df["country_clean"].fillna("UNKNOWN")))
 
@@ -168,6 +188,7 @@ def main():
     t0 = time.time()
     candidates = generate_candidates(s1_df, pool_df)
     report["blocking_seconds"] = time.time() - t0
+    logger.info("candidate generation complete in %.1fs", report["blocking_seconds"])
 
     val_gt = {sid: ground_truth.get(sid, set()) for sid in val_ids}
     report["blocking"] = metrics.blocking_report(candidates, val_gt, len(pool_df))
@@ -180,12 +201,14 @@ def main():
     )
 
     # --- stage B: pairwise model ------------------------------------------
+    feature_started = time.time()
     s1_views, pool_views = build_record_views(s1_df), build_record_views(pool_df)
     name_column = "business_name_core" if "business_name_core" in s1_df.columns else "business_name_clean"
     name_idf = build_idf(_tokens(s1_df, name_column), _tokens(pool_df, name_column))
     addr_idf = build_idf(
         _tokens(s1_df, "business_address_clean"), _tokens(pool_df, "business_address_clean")
     )
+    logger.info("record views and IDF features ready in %.1fs", time.time() - feature_started)
 
     logger.info("featurising training pairs")
     train_subset = {sid: candidates.get(sid, {}) for sid in fit_ids}
@@ -193,20 +216,24 @@ def main():
     y_train = label_pairs(train_index, ground_truth)
     logger.info("train pairs: %d (%d positive)", len(y_train), int(y_train.sum()))
 
+    fit_started = time.time()
     matcher = PairwiseMatcher(random_state=args.seed).fit(
         X_train, y_train, train_index["s1_entity_id"].to_numpy(dtype=object)
     )
+    logger.info("pairwise model and calibration complete in %.1fs", time.time() - fit_started)
     report["feature_importance"] = dict(
         list(matcher.feature_importance(X_train, y_train).items())[:15]
     )
 
     logger.info("scoring tuning and validation pairs")
+    score_started = time.time()
     tune_scored, _, _ = _score_pairs(
         matcher, candidates, s1_views, pool_views, name_idf, addr_idf, tune_ids
     )
     val_scored, _, _ = _score_pairs(
         matcher, candidates, s1_views, pool_views, name_idf, addr_idf, val_ids
     )
+    logger.info("tuning and validation scoring complete in %.1fs", time.time() - score_started)
 
     # --- stages C and D: ablation -----------------------------------------
     tune_gt = {sid: ground_truth.get(sid, set()) for sid in tune_ids}
@@ -256,8 +283,11 @@ def main():
     # --- test set prediction -----------------------------------------------
     if args.test_dir:
         logger.info("predicting the test set")
+        test_started = time.time()
         test_s1, test_pool = _load_sources(args.test_dir, "test")
+        logger.info("test data loaded | source1=%d pool=%d", len(test_s1), len(test_pool))
         test_candidates = generate_candidates(test_s1, test_pool)
+        logger.info("test candidate generation complete in %.1fs", time.time() - test_started)
 
         test_s1_views, test_pool_views = build_record_views(test_s1), build_record_views(test_pool)
         test_ids = test_s1["entity_id"].tolist()
@@ -275,6 +305,8 @@ def main():
         test_predictions = select_matches(working, args.strategy, **kwargs)
         if conflict_stage == "post":
             test_predictions, _ = resolve.resolve_predictions(test_predictions, working)
+
+        logger.info("test scoring and selection complete in %.1fs", time.time() - test_started)
 
         match_io.write_matching_results(
             os.path.join(args.output_dir, "matching_results.tsv"), test_ids, test_predictions
