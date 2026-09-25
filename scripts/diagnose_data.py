@@ -15,8 +15,10 @@ is inconsistent, not the model.
 """
 import argparse
 import json
+import logging
 import os
 import sys
+import time
 from collections import Counter
 
 import pandas as pd
@@ -25,26 +27,55 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.matching.io import load_ground_truth
 
+logger = logging.getLogger("diagnose_data")
+
 
 def _read_ids(data_dir, prefix, source):
     """entity_id column from the processed parquet if present, else the raw TSV."""
+    started = time.time()
     parquet = os.path.join(data_dir, f"{prefix}_{source}_processed.parquet")
     if os.path.exists(parquet):
-        return set(pd.read_parquet(parquet, columns=["entity_id"])["entity_id"].astype(str))
+        ids = set(pd.read_parquet(parquet, columns=["entity_id"])["entity_id"].astype(str))
+        logger.info(
+            "loaded %s | records=%d | elapsed=%.1fs",
+            parquet, len(ids), time.time() - started,
+        )
+        return ids
     tsv = os.path.join(data_dir, f"{prefix}_{source}.tsv")
     if os.path.exists(tsv):
-        return set(pd.read_csv(tsv, sep="\t", dtype=str, usecols=["entity_id"])["entity_id"].astype(str))
+        ids = set(pd.read_csv(tsv, sep="\t", dtype=str, usecols=["entity_id"])["entity_id"].astype(str))
+        logger.info(
+            "loaded %s | records=%d | elapsed=%.1fs",
+            tsv, len(ids), time.time() - started,
+        )
+        return ids
     raise FileNotFoundError(f"neither {parquet} nor {tsv} exists")
 
 
 def diagnose(train_dir, ground_truth_path=None):
-    gt_path = ground_truth_path or os.path.join(train_dir, "train_ground_truth.tsv")
+    started = time.time()
+    if ground_truth_path:
+        gt_path = ground_truth_path
+    else:
+        local_gt_path = os.path.join(train_dir, "train_ground_truth.tsv")
+        repo_gt_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "dataset", "train",
+            "train_ground_truth.tsv",
+        )
+        gt_path = local_gt_path if os.path.exists(local_gt_path) else repo_gt_path
+    logger.info("loading ground truth from %s", os.path.abspath(gt_path))
     ground_truth = load_ground_truth(gt_path)
+    logger.info("ground truth loaded | rows=%d", len(ground_truth))
 
+    logger.info("loading source identifiers from %s", os.path.abspath(train_dir))
     s1_ids = _read_ids(train_dir, "train", "source1")
     s2_ids = _read_ids(train_dir, "train", "source2")
     s3_ids = _read_ids(train_dir, "train", "source3")
     pool_ids = s2_ids | s3_ids
+    logger.info(
+        "source identifiers loaded | source1=%d source2=%d source3=%d pool=%d",
+        len(s1_ids), len(s2_ids), len(s3_ids), len(pool_ids),
+    )
 
     # --- do the labelled entities exist in source1? ------------------------
     gt_s1 = set(ground_truth)
@@ -56,7 +87,11 @@ def diagnose(train_dir, ground_truth_path=None):
     missing_by_prefix = Counter()
     entities_fully_present = entities_with_truth = 0
 
-    for s1_id, matches in ground_truth.items():
+    logger.info("checking labelled matches against the pool")
+    total_labels = len(ground_truth)
+    for label_number, (s1_id, matches) in enumerate(ground_truth.items(), start=1):
+        if label_number % 250000 == 0:
+            logger.info("checked %d/%d labelled entities", label_number, total_labels)
         if s1_id not in s1_ids:
             continue
         if not matches:
@@ -84,7 +119,7 @@ def diagnose(train_dir, ground_truth_path=None):
         if ground_truth[s1_id] and not (ground_truth[s1_id] & pool_ids)
     )
 
-    return {
+    report = {
         "source1_records": len(s1_ids),
         "pool_records": len(pool_ids),
         "ground_truth_rows": len(ground_truth),
@@ -102,6 +137,8 @@ def diagnose(train_dir, ground_truth_path=None):
         "unwinnable_entities": unwinnable,
         "unwinnable_rate": unwinnable / scored_entities if scored_entities else 0.0,
     }
+    logger.info("diagnosis complete in %.1fs", time.time() - started)
+    return report
 
 
 def main():
@@ -111,6 +148,7 @@ def main():
     parser.add_argument("--report-file", default=None)
     args = parser.parse_args()
 
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     report = diagnose(args.train_dir, args.ground_truth)
     print(json.dumps(report, indent=2))
 
