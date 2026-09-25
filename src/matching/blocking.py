@@ -373,6 +373,27 @@ def channel_contribution(candidates, ground_truth):
     return report
 
 
+def _config_cache_view(config):
+    """
+    A JSON-serialisable, run-stable view of the blocking config.
+
+    The config can hold live objects - the embedding encoder - which are not
+    serialisable, and whose repr carries a memory address that would differ on
+    every run and defeat the cache entirely. Objects are therefore reduced to a
+    stable identifier: what the candidates depend on is which model produced
+    the vectors, not which Python object held it.
+    """
+    view = {}
+    for key, value in (config or {}).items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            view[key] = value
+        elif isinstance(value, (list, tuple)):
+            view[key] = [v if isinstance(v, (str, int, float, bool)) else str(v) for v in value]
+        else:
+            view[key] = getattr(value, "model_name", None) or type(value).__name__
+    return view
+
+
 def _fingerprint(s1_df, pool_df, config):
     """Stable id for a (data, config) combination, used as the cache key."""
     hasher = hashlib.sha256()
@@ -380,7 +401,7 @@ def _fingerprint(s1_df, pool_df, config):
         ids = df["entity_id"].astype(str).to_numpy()
         hasher.update(str(len(ids)).encode())
         hasher.update(hashlib.sha256("\x00".join(ids).encode()).digest())
-    hasher.update(json.dumps(config or {}, sort_keys=True).encode())
+    hasher.update(json.dumps(_config_cache_view(config), sort_keys=True).encode())
     return hasher.hexdigest()[:16]
 
 

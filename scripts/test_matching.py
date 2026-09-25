@@ -459,6 +459,51 @@ def test_embedding_channel_and_cosines():
     print("  embedding channel and cosine feature OK")
 
 
+def test_embedding_vector_cache(tmp_dir):
+    """
+    Encoding a full pool is the slowest part of the embedding stage and is
+    deterministic, so it must be encoded once and reused. The cache also has to
+    notice when the text changes, or a preprocessing edit would be scored
+    against stale vectors.
+    """
+    from src.matching.embeddings import build_embedding_lookup
+
+    s1, _ = _toy_frames()
+
+    class CountingEncoder(_StubEncoder):
+        calls = 0
+
+        def encode(self, texts):
+            CountingEncoder.calls += 1
+            return super().encode(texts)
+
+    encoder = CountingEncoder()
+    first_index, first = build_embedding_lookup(s1, encoder, tmp_dir, "t")
+    second_index, second = build_embedding_lookup(s1, encoder, tmp_dir, "t")
+    assert CountingEncoder.calls == 1, "cached run re-encoded"
+    assert np.array_equal(first, second) and first_index == second_index
+
+    # changed text must miss the cache rather than reuse stale vectors
+    edited = s1.copy()
+    edited.loc[edited.index[0], "business_name_clean"] = "completely different name"
+    build_embedding_lookup(edited, encoder, tmp_dir, "t")
+    assert CountingEncoder.calls == 2, "cache ignored changed text"
+
+    # no cache_dir means no caching, and must still work
+    build_embedding_lookup(s1, encoder, None, "t")
+    assert CountingEncoder.calls == 3
+    print("  embedding vector cache OK")
+
+
+def test_device_resolution():
+    from src.matching.embeddings import resolve_device
+
+    assert resolve_device("cpu") == "cpu", "explicit device must win"
+    assert resolve_device("mps") == "mps"
+    resolve_device(None)  # must not raise when torch is absent
+    print("  device resolution OK")
+
+
 def test_ann_recall_against_exact():
     """
     The ANN index must not quietly lose recall - the whole point of the channel
@@ -494,6 +539,112 @@ def test_embed_cosine_feature_slot():
     except ValueError:
         pass
     print("  embed_cosine feature slot OK")
+
+
+def test_hashing_encoder_is_deterministic():
+    """
+    The vector cache keys on the text, so an encoder whose output changes
+    between processes would serve stale vectors. Python's hash() is randomised
+    per process, which is why this uses crc32.
+    """
+    from src.matching.embeddings import HashingEncoder, build_encoder
+
+    encoder = HashingEncoder()
+    first = encoder.encode(["sunrise textiles pvt ltd", "granite motors llc"])
+    second = HashingEncoder().encode(["sunrise textiles pvt ltd", "granite motors llc"])
+    assert np.allclose(first, second), "hashing encoder is not deterministic"
+    assert np.allclose(np.linalg.norm(first, axis=1), 1.0, atol=1e-5)
+
+    # surface-similar strings should be closer than unrelated ones
+    variants = encoder.encode(["sunrise textiles private limited", "sunrise textiles pvt ltd"])
+    unrelated = encoder.encode(["sunrise textiles private limited", "granite motors llc"])
+    assert float(variants[0] @ variants[1]) > float(unrelated[0] @ unrelated[1])
+
+    assert isinstance(build_encoder("hashing"), HashingEncoder)
+    print("  hashing encoder determinism OK")
+
+
+def test_cache_key_handles_live_objects():
+    """
+    The blocking config carries a live encoder once embeddings are on. Encoding
+    it naively raised TypeError, and using its repr would embed a memory
+    address that changes every run and defeats the cache.
+    """
+    from src.matching.blocking import _config_cache_view, _fingerprint
+    from src.matching.embeddings import HashingEncoder
+
+    frame = pd.DataFrame({"entity_id": ["a", "b"]})
+    one = {"channels": ["name_char"], "embedding_encoder": HashingEncoder()}
+    two = {"channels": ["name_char"], "embedding_encoder": HashingEncoder()}
+
+    assert _config_cache_view(one)["embedding_encoder"] == "hashing"
+    assert _fingerprint(frame, frame, one) == _fingerprint(frame, frame, two), (
+        "separate encoder instances must produce the same cache key"
+    )
+    without = {"channels": ["name_char"], "embedding_encoder": None}
+    assert _fingerprint(frame, frame, one) != _fingerprint(frame, frame, without)
+    print("  cache key handles live objects OK")
+
+
+def test_submission_package(tmp_dir):
+    """
+    The package must match the required layout, and must never be built from
+    outputs that fail the validator - a failing submission is not evaluated.
+    """
+    import subprocess
+    import zipfile
+
+    output_dir = os.path.join(tmp_dir, "output")
+    os.makedirs(output_dir)
+    with open(os.path.join(output_dir, "matching_results.tsv"), "w") as handle:
+        handle.write("source1_entity_id\tmatched_entity_ids\nS1-1\tS2-1\nS1-2\t\n")
+    with open(os.path.join(output_dir, "candidate_pairs.tsv"), "w") as handle:
+        handle.write("source1_entity_id\tcandidate_entity_ids\nS1-1\tS2-1\nS1-2\t\n")
+
+    # the validator needs the test set: its central rule is that every test
+    # Source 1 entity appears exactly once
+    test_dir = os.path.join(tmp_dir, "test")
+    os.makedirs(test_dir)
+    for source, rows in (("source1", ["S1-1", "S1-2"]), ("source2", ["S2-1", "S2-2"]),
+                         ("source3", ["S3-1"])):
+        with open(os.path.join(test_dir, f"test_{source}.tsv"), "w") as handle:
+            handle.write("entity_id\tbusiness_name\tbusiness_address\tcountry\n")
+            for row in rows:
+                handle.write(f"{row}\tname\taddress\tIndia\n")
+
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_submission.py")
+    result = subprocess.run(
+        [sys.executable, script, "--team-name", "t", "--output-dir", output_dir,
+         "--test-dir", test_dir, "--dest", os.path.join(tmp_dir, "dist")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    archive = os.path.join(tmp_dir, "dist", "t_submission.zip")
+    with zipfile.ZipFile(archive) as zf:
+        names = set(zf.namelist())
+        requirements = zf.read("t_submission/code/business_entity_resolution/requirements.txt").decode()
+
+    for required in ("t_submission/output/matching_results.tsv",
+                     "t_submission/output/candidate_pairs.tsv",
+                     "t_submission/Documentation_template.md",
+                     "t_submission/code/business_entity_resolution/README.md",
+                     "t_submission/code/business_entity_resolution/requirements.txt"):
+        assert required in names, f"missing {required}"
+    assert any("/src/matching/" in n for n in names), "source not packaged"
+    # the challenge asks for pinned dependencies, not ranges
+    assert "==" in requirements and ">=" not in requirements, requirements
+
+    # a duplicated Source 1 row fails validation, so packaging must be refused
+    with open(os.path.join(output_dir, "matching_results.tsv"), "w") as handle:
+        handle.write("source1_entity_id\tmatched_entity_ids\nS1-1\tS2-1\nS1-1\tS2-2\n")
+    refused = subprocess.run(
+        [sys.executable, script, "--team-name", "t2", "--output-dir", output_dir,
+         "--test-dir", test_dir, "--dest", os.path.join(tmp_dir, "dist")],
+        capture_output=True, text=True,
+    )
+    assert refused.returncode != 0, "packaged an invalid submission"
+    print("  submission package layout and refusal OK")
 
 
 def test_split_is_entity_level_and_stratified():
@@ -552,6 +703,9 @@ def main():
     test_channel_pruning_and_zero_idf_guard()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()
+    test_device_resolution()
+    test_hashing_encoder_is_deterministic()
+    test_cache_key_handles_live_objects()
     test_embed_cosine_feature_slot()
     test_one_to_one_check()
     test_conflict_resolution_post()
@@ -567,6 +721,10 @@ def main():
         test_candidate_cache_roundtrip(tmp_dir)
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_score_cache_roundtrip_and_key(tmp_dir)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        test_embedding_vector_cache(tmp_dir)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        test_submission_package(tmp_dir)
     print("\nall matching tests passed")
 
 

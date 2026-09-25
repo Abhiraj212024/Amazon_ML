@@ -194,7 +194,9 @@ def main():
     parser.add_argument("--embeddings", action="store_true",
                         help="enable the dense embedding channel and cosine feature "
                              "(needs sentence-transformers and hnswlib)")
-    parser.add_argument("--embedding-model", default=None)
+    parser.add_argument("--embedding-model", default=None,
+                        help="model name or local path; 'hashing' uses a deterministic "
+                             "offline stand-in that exercises the path without a download")
     parser.add_argument("--embedding-batch-size", type=int, default=256)
     parser.add_argument("--embedding-device", default=None)
     parser.add_argument("--seed", type=int, default=42)
@@ -270,12 +272,12 @@ def main():
 
     encoder = None
     if args.embeddings:
-        from src.matching.embeddings import DEFAULT_MODEL, SentenceTransformerEncoder
+        from src.matching.embeddings import DEFAULT_MODEL, build_encoder
 
         model_name = args.embedding_model or DEFAULT_MODEL
         logger.info("loading embedding model %s", model_name)
         encoder_started = time.time()
-        encoder = SentenceTransformerEncoder(
+        encoder = build_encoder(
             model_name, args.embedding_batch_size, args.embedding_device
         )
         logger.info("embedding model ready in %.1fs", time.time() - encoder_started)
@@ -318,13 +320,14 @@ def main():
         from src.matching.embeddings import build_embedding_lookup
 
         started = time.time()
-        s1_map, s1_vectors = build_embedding_lookup(s1_df, encoder)
-        pool_map, pool_vectors = build_embedding_lookup(pool_df, encoder)
+        s1_map, s1_vectors = build_embedding_lookup(s1_df, encoder, args.cache_dir, "train_s1")
+        pool_map, pool_vectors = build_embedding_lookup(pool_df, encoder, args.cache_dir, "train_pool")
         embedding = (s1_map, s1_vectors, pool_map, pool_vectors)
         report["embedding"] = {
             "model": getattr(encoder, "model_name", "unknown"),
             "dimensions": int(s1_vectors.shape[1]),
             "encode_seconds": round(time.time() - started, 1),
+            "device": getattr(encoder, "device", None),
         }
         logger.info("record embeddings ready in %.1fs", time.time() - started)
 
@@ -448,8 +451,8 @@ def main():
         if encoder is not None:
             from src.matching.embeddings import build_embedding_lookup
 
-            t_s1_map, t_s1_vec = build_embedding_lookup(test_s1, encoder)
-            t_pool_map, t_pool_vec = build_embedding_lookup(test_pool, encoder)
+            t_s1_map, t_s1_vec = build_embedding_lookup(test_s1, encoder, args.cache_dir, "test_s1")
+            t_pool_map, t_pool_vec = build_embedding_lookup(test_pool, encoder, args.cache_dir, "test_pool")
             test_embedding = (t_s1_map, t_s1_vec, t_pool_map, t_pool_vec)
 
         test_scored, _, _ = _score_pairs(

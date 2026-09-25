@@ -18,13 +18,41 @@ model of at most 8B parameters. Multilingual models are the right family here,
 because the training data is transliterated Indian and US text and the test set
 adds France.
 """
+import hashlib
 import logging
+import os
+import zlib
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+
+def resolve_device(requested=None):
+    """
+    Pick the fastest available backend.
+
+    On Apple Silicon the MPS backend is several times faster than CPU for
+    encoding, and encoding a full pool is the slowest part of enabling
+    embeddings at all -- so defaulting to CPU there is a real cost. Falls back
+    quietly when torch is absent or no accelerator exists.
+    """
+    if requested:
+        return requested
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - depends on environment
+        return None
+
+    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        logger.info("using the Apple Silicon MPS backend for encoding")
+        return "mps"
+    if torch.cuda.is_available():
+        logger.info("using CUDA for encoding")
+        return "cuda"
+    return "cpu"
 
 
 def serialise_records(df):
@@ -67,7 +95,21 @@ class SentenceTransformerEncoder:
                 "pip install sentence-transformers"
             ) from error
 
-        self.model = SentenceTransformer(model_name, device=device)
+        device = resolve_device(device)
+        self.device = device
+        try:
+            self.model = SentenceTransformer(model_name, device=device)
+        except Exception as error:  # pragma: no cover - depends on environment
+            # a raw stack trace from deep inside the hub client tells the user
+            # nothing about what to do next
+            raise RuntimeError(
+                f"could not load the embedding model {model_name!r}: {error}\n"
+                "If this is a network or proxy failure, the model could not be "
+                "downloaded. Either allow access to the model host, pre-download "
+                "the model and pass its local path to --embedding-model, or use "
+                "--embedding-model hashing to exercise the embedding path "
+                "offline with a deterministic stand-in encoder."
+            ) from error
         self.batch_size = batch_size
         self.model_name = model_name
 
@@ -80,6 +122,49 @@ class SentenceTransformerEncoder:
             show_progress_bar=False,
         )
         return np.ascontiguousarray(vectors, dtype=np.float32)
+
+
+class HashingEncoder:
+    """
+    Deterministic hashed character-n-gram encoder. No model, no downloads.
+
+    This is a stand-in, not a substitute: it captures surface overlap and
+    nothing semantic, so it will not find the transliteration matches a real
+    model does. Its purpose is to exercise the embedding plumbing end to end -
+    channel, ANN index, cosine feature, caching - where a download is
+    impossible or undesirable, such as in tests and CI.
+
+    Uses crc32 rather than Python's hash(), which is randomised per process and
+    would silently invalidate the vector cache on every run.
+    """
+
+    model_name = "hashing"
+    device = "cpu"
+
+    def __init__(self, dim=256, ngram=3):
+        self.dim = dim
+        self.ngram = ngram
+
+    def encode(self, texts):
+        out = np.zeros((len(texts), self.dim), dtype=np.float32)
+        for row, text in enumerate(texts):
+            padded = f" {str(text).lower()} "
+            for start in range(max(len(padded) - self.ngram + 1, 0)):
+                gram = padded[start:start + self.ngram].encode("utf-8", "replace")
+                out[row, zlib.crc32(gram) % self.dim] += 1.0
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        return out / np.maximum(norms, 1e-9)
+
+
+def build_encoder(model_name=None, batch_size=256, device=None):
+    """Pick the real encoder, or the offline stand-in when asked for it."""
+    if model_name in ("hashing", "stub"):
+        logger.warning(
+            "using the hashing stand-in encoder: it exercises the embedding path "
+            "but captures no semantics, so its scores are not meaningful"
+        )
+        return HashingEncoder()
+    return SentenceTransformerEncoder(model_name or DEFAULT_MODEL, batch_size, device)
 
 
 def _exact_topk(query, pool, k, min_score):
@@ -149,12 +234,52 @@ def embedding_topk(query_vectors, pool_vectors, k=25, min_score=0.5,
     return hits
 
 
-def build_embedding_lookup(df, encoder):
-    """entity_id -> row index, plus the matching matrix of vectors."""
+def build_embedding_lookup(df, encoder, cache_dir=None, tag="records"):
+    """
+    entity_id -> row index, plus the matching matrix of vectors.
+
+    Encoding is by far the slowest part of the embedding stage -- a full pool is
+    hundreds of thousands of records -- and it is perfectly deterministic given
+    the model and the text. Without a cache every run re-encodes everything,
+    which is what makes embeddings feel unusable on a laptop. The key covers
+    the model name and the exact serialised text, so edits to preprocessing
+    invalidate it.
+    """
     texts = serialise_records(df)
+    entity_ids = df["entity_id"].astype(str).tolist()
+    index = {entity_id: row for row, entity_id in enumerate(entity_ids)}
+
+    path = None
+    if cache_dir:
+        hasher = hashlib.sha256()
+        hasher.update(str(getattr(encoder, "model_name", "unknown")).encode())
+        hasher.update(b"\x00")
+        for text in texts:
+            hasher.update(text.encode("utf-8", "replace"))
+            hasher.update(b"\x01")
+        path = os.path.join(cache_dir, f"{tag}_vectors_{hasher.hexdigest()[:16]}.npy")
+
+        if os.path.exists(path):
+            try:
+                vectors = np.load(path)
+            except (ValueError, OSError) as error:
+                logger.warning("ignoring unreadable vector cache %s (%s)", path, error)
+            else:
+                if len(vectors) == len(texts):
+                    logger.info("loaded %d cached vectors from %s", len(vectors), path)
+                    return index, vectors
+                logger.warning("vector cache %s has the wrong length; re-encoding", path)
+
     vectors = encoder.encode(texts)
-    index = {entity_id: row for row, entity_id in enumerate(df["entity_id"].astype(str))}
     logger.info("encoded %d records into %d dimensions", len(vectors), vectors.shape[1])
+
+    if path:
+        os.makedirs(cache_dir, exist_ok=True)
+        tmp = path + ".tmp.npy"
+        np.save(tmp, vectors)
+        os.replace(tmp, path)  # atomic, so an interrupted write leaves no half cache
+        logger.info("cached vectors to %s", path)
+
     return index, vectors
 
 

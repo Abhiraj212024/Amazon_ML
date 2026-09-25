@@ -187,6 +187,37 @@ pip install sentence-transformers hnswlib
 python3 scripts/run_matching.py --train-dir dataset/train --embeddings --cache-dir .cache
 ```
 
+### Checking the embedding path quickly
+
+Encoding a full pool is the slow part, so verify the path works on a slice that
+finishes in minutes before committing to a long run:
+
+```bash
+./scripts/smoke_embeddings.sh --train-dir dataset_5pct/train --entities 400
+```
+
+It carves a tiny *label-consistent* slice (shrinking the pool too, since that is
+what drives encoding cost), runs the pipeline with `--embeddings`, and asserts
+the embedding channel actually ran and retrieved true pairs. It answers "does
+this work", not "is it any good" - the slice is far too small for its score to
+mean anything.
+
+`--embedding-model hashing` swaps in a deterministic character-n-gram encoder
+that needs no download. It captures no semantics, so it is only for exercising
+the plumbing offline or in CI.
+
+### Making it fast enough to use
+
+Two things dominate, and both are handled:
+
+- **Encoding is cached.** Vectors are stored under `--cache-dir`, keyed by the
+  model name and the exact serialised text. Without this every run re-encodes
+  the whole pool, which is what makes embeddings feel unusable on a laptop.
+  Preprocessing changes invalidate the cache automatically.
+- **The device is auto-detected.** On Apple Silicon this picks the MPS backend,
+  which is several times faster than CPU for encoding. Override with
+  `--embedding-device`.
+
 Off by default: it needs both packages and a model download. `--embedding-model`
 picks the model — verify its licence on the model card, since the challenge
 requires MIT/Apache-2.0 and at most 8B parameters. Prefer a multilingual model.
@@ -324,6 +355,58 @@ Blocking dominates the runtime; everything downstream is comparatively cheap.
 ```bash
 python3 scripts/run_matching.py --train-dir dataset/train --cache-dir .cache
 ```
+
+## Building the submission package
+
+```bash
+python3 scripts/build_submission.py \
+    --team-name your_team \
+    --output-dir output --test-dir dataset/test \
+    --report-file reports/matching_full.json
+```
+
+Produces `dist/your_team_submission.zip` in the required layout:
+
+```
+<team_name>_submission.zip
+|-- output/{matching_results,candidate_pairs}.tsv
+|-- code/business_entity_resolution/{src,scripts,utils}/ + README.md + requirements.txt
+`-- Documentation_template.md
+```
+
+Two challenge rules drive it. Submissions that fail validation are not
+evaluated, so the outputs go through `utils/validate_submission.py` first and
+the archive is **refused** if they do not pass (override with
+`--skip-validation`, which you should not need). And dependencies must be
+pinned, so `requirements.txt` is written from the versions actually installed
+in the environment that produced the outputs, not from this repo's ranges.
+
+Without `--test-dir` validation is reported as SKIPPED rather than as a pass -
+the central rule is that every test Source 1 entity appears exactly once, which
+cannot be checked without the test set.
+
+Pass the challenge's own template with `--documentation` to use it as the base.
+Either way the methodology document gains an auto-generated appendix carrying
+the measured numbers - baseline, blocking recall, channel contribution, the
+ablation, error attribution, calibration - so the prose you write cites real
+results. **The prose itself is yours to write; the scaffold is not a
+submission.**
+
+## Running on a bigger machine
+
+Training does not need the full data - the fit slice is already ample - but
+inference over the complete test set is fixed by the challenge and is the run
+that needs headroom. Blocking cost grows with the *product* of the two sides,
+so a 5% slice does roughly 0.25% of the full work; measure before sizing with
+`scripts/scale_probe.py`.
+
+Memory binds before time. At the 5% slice the candidate set and feature matrix
+are about 1 GB each; at full scale that is ~20 GB each, so prefer a
+memory-optimised instance over a merely fast one. GPU only helps the embedding
+encoder, not the rest of the pipeline.
+
+Carry `--cache-dir` onto the remote machine if you can: blocking, scores and
+embedding vectors all live there, and re-running without it repeats everything.
 
 ## Testing without the dataset
 
