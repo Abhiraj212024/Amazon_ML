@@ -9,11 +9,31 @@ Run: python3 scripts/test_matching.py
 """
 import os
 import sys
+import textwrap
 
 import numpy as np
 import pandas as pd
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+def _project_root():
+    """
+    Locate the directory that holds `src/`, searching upward from this file.
+
+    The repository keeps scripts beside `src/`, while the submission package
+    places them under `src/` so that all source sits there as the challenge
+    requires. Searching upward makes the same file work in both layouts.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.isdir(os.path.join(here, "src", "matching")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    raise RuntimeError("could not locate the project root containing src/matching")
+
+
+sys.path.insert(0, _project_root())
 
 from src.matching import io as match_io
 from src.matching import metrics, resolve, splits
@@ -623,15 +643,22 @@ def test_submission_package(tmp_dir):
     archive = os.path.join(tmp_dir, "dist", "t_submission.zip")
     with zipfile.ZipFile(archive) as zf:
         names = set(zf.namelist())
-        requirements = zf.read("t_submission/code/business_entity_resolution/requirements.txt").decode()
+        requirements = zf.read("code/business_entity_resolution/requirements.txt").decode()
 
-    for required in ("t_submission/output/matching_results.tsv",
-                     "t_submission/output/candidate_pairs.tsv",
-                     "t_submission/Documentation_template.md",
-                     "t_submission/code/business_entity_resolution/README.md",
-                     "t_submission/code/business_entity_resolution/requirements.txt"):
+    # the spec's tree puts these at the root of the archive, with no wrapper
+    for required in ("output/matching_results.tsv",
+                     "output/candidate_pairs.tsv",
+                     "Documentation_template.md",
+                     "code/business_entity_resolution/README.md",
+                     "code/business_entity_resolution/requirements.txt"):
         assert required in names, f"missing {required}"
-    assert any("/src/matching/" in n for n in names), "source not packaged"
+    # "Put all source under src/": scripts and utils move beneath it
+    assert "code/business_entity_resolution/src/matching/blocking.py" in names
+    assert "code/business_entity_resolution/src/scripts/run_matching.py" in names
+    assert "code/business_entity_resolution/src/utils/validate_submission.py" in names
+    assert not any(n.startswith("code/business_entity_resolution/scripts/") for n in names), (
+        "scripts must live under src/, not beside it"
+    )
     # the challenge asks for pinned dependencies, not ranges
     assert "==" in requirements and ">=" not in requirements, requirements
 
@@ -645,6 +672,63 @@ def test_submission_package(tmp_dir):
     )
     assert refused.returncode != 0, "packaged an invalid submission"
     print("  submission package layout and refusal OK")
+
+
+def test_blocking_is_reproducible_across_processes():
+    """
+    candidate_pairs.tsv is audited by the organisers, so it has to be the same
+    on every run. Set iteration order over strings varies between processes
+    (hash randomisation); because float addition is not associative that
+    changed the accumulated weights slightly and flipped ties at the k-th
+    position, so two identical runs produced different candidate sets.
+
+    This spawns subprocesses with different PYTHONHASHSEED values, which an
+    in-process check cannot do - the seed is fixed once the interpreter starts.
+    """
+    import subprocess
+
+    program = textwrap.dedent(
+        """
+        import json, os, sys
+        sys.path.insert(0, os.environ["PROJECT_ROOT"])
+        import pandas as pd
+        from src.preprocessing.pipeline import preprocess_dataframe
+        from src.matching.blocking import generate_candidates
+
+        rows_s1, rows_pool = [], []
+        for i in range(40):
+            rows_s1.append({"entity_id": f"S1-{i}",
+                            "business_name": f"sunrise textiles {i} pvt ltd",
+                            "business_address": f"{i} mg road pune 411001",
+                            "country": "India"})
+            for j in range(3):
+                rows_pool.append({"entity_id": f"S2-{i}-{j}",
+                                  "business_name": f"sunrise textile {i} private limited",
+                                  "business_address": f"{i} m g rd pune",
+                                  "country": "India"})
+        s1 = preprocess_dataframe(pd.DataFrame(rows_s1))
+        pool = preprocess_dataframe(pd.DataFrame(rows_pool))
+        candidates = generate_candidates(s1, pool, {"k_name_char": 5, "k_addr_char": 5,
+                                                    "k_name_word": 5, "k_numeric": 5,
+                                                    "k_rare_token": 5})
+        print(json.dumps({k: sorted(v) for k, v in sorted(candidates.items())}))
+        """
+    )
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    outputs = []
+    for seed in ("1", "424242"):
+        environment = dict(os.environ, PYTHONHASHSEED=seed, PROJECT_ROOT=root)
+        result = subprocess.run([sys.executable, "-c", program],
+                                capture_output=True, text=True, env=environment)
+        assert result.returncode == 0, result.stderr[-800:]
+        outputs.append(result.stdout.strip())
+
+    assert outputs[0] == outputs[1], (
+        "blocking is not reproducible across processes; candidate_pairs.tsv "
+        "would differ between identical runs"
+    )
+    print("  blocking reproducible across hash seeds OK")
 
 
 def test_split_is_entity_level_and_stratified():
@@ -701,6 +785,7 @@ def main():
     test_grid_edge_flag_only_when_binding()
     test_calibration_report()
     test_channel_pruning_and_zero_idf_guard()
+    test_blocking_is_reproducible_across_processes()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()
     test_device_resolution()

@@ -71,11 +71,18 @@ def _containment(a, b):
 
 
 def _idf_overlap(a, b, idf):
-    """Shared tokens weighted by rarity, normalised by the smaller side's mass."""
+    """
+    Shared tokens weighted by rarity, normalised by the smaller side's mass.
+
+    Summed in sorted order because set iteration order over strings varies
+    between processes, and float addition is not associative - an unsorted sum
+    makes the feature value, and therefore the prediction, irreproducible.
+    """
     if not a or not b:
         return 0.0
-    shared = sum(idf.get(t, 0.0) for t in a & b)
-    denom = min(sum(idf.get(t, 0.0) for t in a), sum(idf.get(t, 0.0) for t in b))
+    shared = sum(idf.get(t, 0.0) for t in sorted(a & b))
+    denom = min(sum(idf.get(t, 0.0) for t in sorted(a)),
+                sum(idf.get(t, 0.0) for t in sorted(b)))
     return shared / denom if denom > 0 else 0.0
 
 

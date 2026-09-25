@@ -140,7 +140,12 @@ def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
 
     postings = defaultdict(list)
     for idx, tokens in enumerate(pool_tokens):
-        for token in set(tokens):
+        # sorted, not just deduplicated: set iteration order over strings varies
+        # between processes (hash randomisation), which changes the order of the
+        # float accumulation below. Float addition is not associative, so the
+        # tiny differences flip ties at the k-th position and the candidate set
+        # stops being reproducible across runs.
+        for token in sorted(set(tokens)):
             postings[token].append(idx)
 
     df_cap = max(1, int(max_df_ratio * n_pool), min(min_df_cap, n_pool))
@@ -154,7 +159,7 @@ def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
     for qi, tokens in enumerate(s1_tokens):
         weights = Counter()
         counts = Counter()
-        for token in set(tokens):
+        for token in sorted(set(tokens)):
             if token not in idf:
                 continue
             weight = idf[token]

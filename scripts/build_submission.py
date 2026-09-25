@@ -35,7 +35,7 @@ import zipfile
 from datetime import date
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(REPO_ROOT)
+sys.path.insert(0, REPO_ROOT)
 
 # Everything the pipeline imports at runtime. Pinned from the live environment
 # so the package records what actually produced the outputs.
@@ -45,7 +45,15 @@ RUNTIME_PACKAGES = [
 ]
 OPTIONAL_PACKAGES = ["lightgbm", "sentence-transformers", "hnswlib", "torch"]
 
-CODE_DIRS = ["src", "scripts", "utils"]
+# The spec says "Put all source under src/", so scripts and utils are packaged
+# beneath src/ rather than beside it. The scripts locate the project root by
+# searching upward for src/matching, so they run unchanged in either layout.
+PACKAGED_DIRS = {
+    "src/matching": "src/matching",
+    "src/preprocessing": "src/preprocessing",
+    "scripts": "src/scripts",
+    "utils": "src/utils",
+}
 
 
 def _validate_outputs(output_dir, test_dir):
@@ -137,7 +145,7 @@ Subsampling the sources independently of the ground truth silently caps recall
 at the sampling rate, so verify consistency first:
 
 ```bash
-python3 scripts/diagnose_data.py --train-dir dataset/train
+python3 src/scripts/diagnose_data.py --train-dir dataset/train
 ```
 
 `recall_ceiling` must be ~1.0.
@@ -145,14 +153,14 @@ python3 scripts/diagnose_data.py --train-dir dataset/train
 ## Reproduce the submitted outputs
 
 ```bash
-python3 scripts/run_matching.py \\
+python3 src/scripts/run_matching.py \\
 {chr(10).join(flags)}
 ```
 
 Then validate:
 
 ```bash
-python3 utils/validate_submission.py \\
+python3 src/utils/validate_submission.py \\
     --matching output/matching_results.tsv \\
     --candidate output/candidate_pairs.tsv \\
     --test-dir dataset/test --check-ids
@@ -161,9 +169,15 @@ python3 utils/validate_submission.py \\
 ## Tests
 
 ```bash
-python3 scripts/test_matching.py
-./scripts/preflight.sh
+python3 src/scripts/test_matching.py
 ```
+
+## Layout
+
+All source is under `src/`: `src/matching` and `src/preprocessing` are the
+packages, `src/scripts` the entry points, `src/utils` the standalone helpers.
+The entry points locate the project root by searching upward for
+`src/matching`, so they run from this folder without any path setup.
 """
 
 
@@ -284,6 +298,10 @@ def main():
     parser.add_argument("--documentation", default=None,
                         help="the challenge's Documentation_template.md, used as the base")
     parser.add_argument("--dest", default="dist")
+    parser.add_argument("--wrap-in-folder", action="store_true",
+                        help="nest everything under <team_name>_submission/ inside the zip. "
+                             "Off by default: the spec's tree puts output/, code/ and "
+                             "Documentation_template.md at the root of the archive.")
     parser.add_argument("--skip-validation", action="store_true",
                         help="package even if the validator fails (not recommended)")
     args = parser.parse_args()
@@ -325,7 +343,10 @@ def main():
     archive = os.path.join(args.dest, f"{args.team_name}_submission.zip")
 
     with tempfile.TemporaryDirectory() as staging:
-        root = os.path.join(staging, f"{args.team_name}_submission")
+        # the spec's tree puts output/, code/ and the document at the archive
+        # root, so no wrapper folder unless explicitly asked for
+        root = os.path.join(staging, f"{args.team_name}_submission") if args.wrap_in_folder \
+            else os.path.join(staging, "submission")
         code_root = os.path.join(root, "code", "business_entity_resolution")
         os.makedirs(os.path.join(root, "output"), exist_ok=True)
         os.makedirs(code_root, exist_ok=True)
@@ -333,13 +354,18 @@ def main():
         for name in ("matching_results.tsv", "candidate_pairs.tsv"):
             shutil.copy2(os.path.join(args.output_dir, name), os.path.join(root, "output", name))
 
-        for directory in CODE_DIRS:
-            source = os.path.join(REPO_ROOT, directory)
+        for source_rel, packaged_rel in PACKAGED_DIRS.items():
+            source = os.path.join(REPO_ROOT, source_rel)
             if os.path.isdir(source):
                 shutil.copytree(
-                    source, os.path.join(code_root, directory),
+                    source, os.path.join(code_root, packaged_rel),
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
                 )
+        # make src/ a package root even though the subpackages carry __init__
+        init = os.path.join(code_root, "src", "__init__.py")
+        if not os.path.exists(init):
+            with open(init, "w") as handle:
+                handle.write("")
 
         with open(os.path.join(code_root, "requirements.txt"), "w") as handle:
             handle.write(requirements)
@@ -356,18 +382,37 @@ def main():
         with open(os.path.join(root, "Documentation_template.md"), "w") as handle:
             handle.write(base_doc.rstrip() + "\n" + _methodology_appendix(report))
 
+        base = staging if args.wrap_in_folder else root
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
             for folder, _, files in os.walk(root):
                 for name in sorted(files):
                     full = os.path.join(folder, name)
-                    zf.write(full, os.path.relpath(full, staging))
+                    zf.write(full, os.path.relpath(full, base))
 
     print(f"\n  wrote {archive} ({os.path.getsize(archive):,} bytes)")
     with zipfile.ZipFile(archive) as zf:
         entries = zf.namelist()
     print(f"  {len(entries)} entries\n")
-    for entry in sorted(e for e in entries if e.count("/") <= 3)[:14]:
-        print(f"    {entry}")
+
+    prefix = f"{args.team_name}_submission/" if args.wrap_in_folder else ""
+    required = [
+        f"{prefix}output/matching_results.tsv",
+        f"{prefix}output/candidate_pairs.tsv",
+        f"{prefix}code/business_entity_resolution/README.md",
+        f"{prefix}code/business_entity_resolution/requirements.txt",
+        f"{prefix}Documentation_template.md",
+    ]
+    print("  structure required by the challenge:")
+    missing = False
+    for entry in required:
+        present = entry in entries
+        missing = missing or not present
+        print(f"    [{'OK' if present else '--'}] {entry}")
+    source_files = [e for e in entries if f"{prefix}code/business_entity_resolution/src/" in e]
+    print(f"    [{'OK' if source_files else '--'}] "
+          f"code/business_entity_resolution/src/ ({len(source_files)} files)")
+    if missing or not source_files:
+        sys.exit("\nERROR: the archive is missing required entries")
 
     print("\nBefore submitting, replace the methodology scaffold with your own write-up.")
 
