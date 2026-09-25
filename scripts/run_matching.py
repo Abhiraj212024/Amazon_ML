@@ -16,16 +16,19 @@ import os
 import sys
 import time
 
+import numpy as np
 import pandas as pd
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.matching import io as match_io
-from src.matching import metrics, resolve, splits
+from src.matching import metrics, resolve, scorecache, splits
 from src.matching.blocking import channel_contribution, generate_candidates_cached
-from src.matching.decide import select_matches, tune_threshold
+from src.matching.decide import select_matches, tune_threshold, tune_tiered
 from src.matching.model import PairwiseMatcher, label_pairs
-from src.matching.pair_features import build_idf, build_pair_table, build_record_views
+from src.matching.pair_features import (
+    build_idf, build_pair_table, build_record_views, set_embedding_feature,
+)
 from src.preprocessing.pipeline import preprocess_dataframe
 
 logger = logging.getLogger("run_matching")
@@ -63,21 +66,73 @@ def _tokens(df, column):
     return [t.split() for t in df[column].fillna("").astype(str)]
 
 
-def _score_pairs(matcher, candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids):
-    """Featurise and score, returning dict s1_id -> [(candidate_id, prob), ...]."""
+def _featurise(candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids, embedding):
+    """Build the feature matrix, filling the cosine column when embeddings are on."""
     subset = {sid: candidates.get(sid, {}) for sid in s1_ids}
     X, pair_index = build_pair_table(subset, s1_views, pool_views, name_idf, addr_idf)
 
+    if embedding is not None and len(X):
+        from src.matching.embeddings import pair_cosines
+
+        started = time.time()
+        set_embedding_feature(X, pair_cosines(pair_index, *embedding))
+        logger.info("embedding cosines for %d pairs in %.1fs", len(X), time.time() - started)
+
+    return X, pair_index
+
+
+def _score_pairs(matcher, candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids,
+                 embedding=None, cache_dir=None, cache_tag=None, cache_extra=None):
+    """
+    Featurise and score, returning dict s1_id -> [(candidate_id, prob), ...].
+
+    Featurising and scoring is several minutes at real scale, and it is the
+    loop paid on every decision-layer experiment - which is where most of the
+    loss sits. Caching it on the candidate set plus the model configuration
+    makes a full threshold sweep effectively free.
+    """
+    subset = {sid: candidates.get(sid, {}) for sid in s1_ids}
+    key = None
+    if cache_dir and cache_tag:
+        key = scorecache.fingerprint(subset, cache_extra)
+        cached = scorecache.load(cache_dir, cache_tag, key)
+        if cached is not None:
+            return cached["scored"], cached.get("labels"), cached.get("probs")
+
+    started = time.time()
+    X, pair_index = _featurise(
+        candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids, embedding
+    )
+
     scored = {sid: [] for sid in s1_ids}
     if len(X) == 0:
-        return scored, X, pair_index
+        return scored, None, None
 
     probs = matcher.predict_proba(X)
     for s1_id, cand_id, prob in zip(
         pair_index["s1_entity_id"], pair_index["candidate_entity_id"], probs
     ):
         scored[s1_id].append((cand_id, float(prob)))
-    return scored, X, pair_index
+    logger.info("scored %d pairs in %.1fs", len(X), time.time() - started)
+
+    if key is not None:
+        scorecache.save(cache_dir, cache_tag, key,
+                        {"scored": scored, "labels": None, "probs": probs})
+    return scored, None, probs
+
+
+def _strategy_kwargs(strategy, tuned, tuned_tiered, max_k):
+    """Tuned parameters for one strategy, in the form select_matches expects."""
+    if strategy == "threshold":
+        return {"t_high": tuned["t_high"], "ratio": tuned["ratio"], "max_k": max_k}
+    if strategy == "tiered":
+        return {
+            "t_first": tuned_tiered["t_first"], "t_rest": tuned_tiered["t_rest"],
+            "ratio": tuned_tiered["ratio"], "max_k": max_k,
+        }
+    if strategy == "top1":
+        return {"t_high": tuned["t_high"]}
+    return {"max_k": max_k}
 
 
 def _evaluate(scored, candidates, ground_truth, country_of, strategy, conflict_stage,
@@ -120,8 +175,8 @@ def main():
                         help="share of the training entities reserved for tuning thresholds")
     parser.add_argument("--holdout-country", default=None,
                         help="validate on this country only, as a proxy for the unseen test country")
-    parser.add_argument("--strategy", default="expected_f05",
-                        choices=("expected_f05", "threshold", "top1"))
+    parser.add_argument("--strategy", default="tiered",
+                        choices=("tiered", "expected_f05", "threshold", "top1"))
     parser.add_argument("--conflict-stage", default="post", choices=("none", "pre", "post"))
     parser.add_argument("--no-ablation", action="store_true")
     parser.add_argument("--cache-dir", default=None,
@@ -129,6 +184,19 @@ def main():
                              "and the blocking config, so it invalidates itself")
     parser.add_argument("--blocking-threads", type=int, default=-1,
                         help="threads for the sparse top-k product (-1 = all cores)")
+    parser.add_argument("--channels", default=None,
+                        help="comma-separated blocking channels to run. Measured unique "
+                             "recall: addr_char 12.4%%, rare_token 0.29%%, numeric 0.24%%, "
+                             "name_char 0.20%%, name_word 0.04%%. Pruning the cheap ones "
+                             "buys back most of the blocking time.")
+    parser.add_argument("--max-k", type=int, default=10,
+                        help="most matches predictable for one entity")
+    parser.add_argument("--embeddings", action="store_true",
+                        help="enable the dense embedding channel and cosine feature "
+                             "(needs sentence-transformers and hnswlib)")
+    parser.add_argument("--embedding-model", default=None)
+    parser.add_argument("--embedding-batch-size", type=int, default=256)
+    parser.add_argument("--embedding-device", default=None)
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -191,7 +259,34 @@ def main():
     # --- stage A: blocking -------------------------------------------------
     logger.info("generating candidates")
     t0 = time.time()
-    blocking_config = {"n_threads": args.blocking_threads}
+    from src.matching.blocking import CHANNELS
+
+    if args.channels:
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+    else:
+        channels = [c for c in CHANNELS if c != "embedding"]
+    if args.embeddings and "embedding" not in channels:
+        channels.append("embedding")
+
+    encoder = None
+    if args.embeddings:
+        from src.matching.embeddings import DEFAULT_MODEL, SentenceTransformerEncoder
+
+        model_name = args.embedding_model or DEFAULT_MODEL
+        logger.info("loading embedding model %s", model_name)
+        encoder_started = time.time()
+        encoder = SentenceTransformerEncoder(
+            model_name, args.embedding_batch_size, args.embedding_device
+        )
+        logger.info("embedding model ready in %.1fs", time.time() - encoder_started)
+
+    blocking_config = {
+        "n_threads": args.blocking_threads,
+        "channels": channels,
+        "embedding_encoder": encoder,
+    }
+    report["blocking_config"] = {"channels": channels, "embeddings": bool(args.embeddings)}
+    logger.info("blocking channels: %s", ", ".join(channels))
     candidates = generate_candidates_cached(
         s1_df, pool_df, blocking_config, args.cache_dir, tag="train"
     )
@@ -218,9 +313,25 @@ def main():
     )
     logger.info("record views and IDF features ready in %.1fs", time.time() - feature_started)
 
+    embedding = None
+    if encoder is not None:
+        from src.matching.embeddings import build_embedding_lookup
+
+        started = time.time()
+        s1_map, s1_vectors = build_embedding_lookup(s1_df, encoder)
+        pool_map, pool_vectors = build_embedding_lookup(pool_df, encoder)
+        embedding = (s1_map, s1_vectors, pool_map, pool_vectors)
+        report["embedding"] = {
+            "model": getattr(encoder, "model_name", "unknown"),
+            "dimensions": int(s1_vectors.shape[1]),
+            "encode_seconds": round(time.time() - started, 1),
+        }
+        logger.info("record embeddings ready in %.1fs", time.time() - started)
+
     logger.info("featurising training pairs")
-    train_subset = {sid: candidates.get(sid, {}) for sid in fit_ids}
-    X_train, train_index = build_pair_table(train_subset, s1_views, pool_views, name_idf, addr_idf)
+    X_train, train_index = _featurise(
+        candidates, s1_views, pool_views, name_idf, addr_idf, fit_ids, embedding
+    )
     y_train = label_pairs(train_index, ground_truth)
     logger.info("train pairs: %d (%d positive)", len(y_train), int(y_train.sum()))
 
@@ -235,32 +346,64 @@ def main():
 
     logger.info("scoring tuning and validation pairs")
     score_started = time.time()
+    cache_extra = {
+        "seed": args.seed, "channels": channels, "embeddings": bool(args.embeddings),
+        "embedding_model": args.embedding_model, "fit_entities": len(fit_ids),
+    }
     tune_scored, _, _ = _score_pairs(
-        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, tune_ids
+        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, tune_ids,
+        embedding, args.cache_dir, "tune", cache_extra,
     )
-    val_scored, _, _ = _score_pairs(
-        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, val_ids
+    val_scored, _, val_probs = _score_pairs(
+        matcher, candidates, s1_views, pool_views, name_idf, addr_idf, val_ids,
+        embedding, args.cache_dir, "val", cache_extra,
     )
     logger.info("tuning and validation scoring complete in %.1fs", time.time() - score_started)
 
     # --- stages C and D: ablation -----------------------------------------
     tune_gt = {sid: ground_truth.get(sid, set()) for sid in tune_ids}
-    tuned = tune_threshold(tune_scored, tune_gt)
+    tuned = tune_threshold(tune_scored, tune_gt, max_k=args.max_k)
+    tuned_tiered = tune_tiered(tune_scored, tune_gt, max_k=args.max_k)
     report["tuned_threshold"] = tuned
-    logger.info("tuned threshold strategy: %s", tuned)
+    report["tuned_tiered"] = tuned_tiered
+    logger.info("tuned threshold: %s", tuned)
+    logger.info("tuned tiered:    %s", tuned_tiered)
+    for name, params in (("threshold", tuned), ("tiered", tuned_tiered)):
+        if params.get("on_grid_edge"):
+            # an optimum sitting on an edge means the grid, not the data, chose it
+            logger.warning(
+                "%s optimum sits on a grid edge for %s; widen the range",
+                name, ", ".join(params["on_grid_edge"]),
+            )
+
+    # how well the probabilities behave as probabilities, which is exactly what
+    # expected_f05 relies on when it weighs adding another candidate
+    val_flat_pairs = [(s, c, p) for s, pairs in val_scored.items() for c, p in pairs]
+    if val_flat_pairs:
+        val_labels = np.array(
+            [1 if c in ground_truth.get(s, ()) else 0 for s, c, _ in val_flat_pairs],
+            dtype=int,
+        )
+        report["calibration"] = scorecache.calibration_report(
+            [p for _, _, p in val_flat_pairs], val_labels
+        )
+        logger.info(
+            "calibration: brier=%.4f mean_predicted=%.4f observed=%.4f",
+            report["calibration"]["brier_score"],
+            report["calibration"]["mean_predicted"],
+            report["calibration"]["observed_rate"],
+        )
 
     combos = (
         [(args.strategy, conflict_stage)]
         if args.no_ablation
-        else [(s, c) for s in ("top1", "threshold", "expected_f05")
+        else [(s, c) for s in ("top1", "threshold", "expected_f05", "tiered")
               for c in (["none"] if conflict_stage == "none" else ["none", "pre", "post"])]
     )
 
     ablation, chosen_predictions = [], None
     for strategy, stage in combos:
-        kwargs = {"t_high": tuned["t_high"], "ratio": tuned["ratio"]} if strategy == "threshold" else {}
-        if strategy == "top1":
-            kwargs = {"t_high": tuned["t_high"]}
+        kwargs = _strategy_kwargs(strategy, tuned, tuned_tiered, args.max_k)
         result, predictions = _evaluate(
             val_scored, candidates, val_gt, country_of, strategy, stage, kwargs
         )
@@ -301,18 +444,27 @@ def main():
 
         test_s1_views, test_pool_views = build_record_views(test_s1), build_record_views(test_pool)
         test_ids = test_s1["entity_id"].tolist()
+        test_embedding = None
+        if encoder is not None:
+            from src.matching.embeddings import build_embedding_lookup
+
+            t_s1_map, t_s1_vec = build_embedding_lookup(test_s1, encoder)
+            t_pool_map, t_pool_vec = build_embedding_lookup(test_pool, encoder)
+            test_embedding = (t_s1_map, t_s1_vec, t_pool_map, t_pool_vec)
+
         test_scored, _, _ = _score_pairs(
             matcher, test_candidates, test_s1_views, test_pool_views,
-            name_idf, addr_idf, test_ids,
+            name_idf, addr_idf, test_ids, test_embedding,
+            args.cache_dir, "test", cache_extra,
         )
 
         working = test_scored
         if conflict_stage == "pre":
             working, _ = resolve.resolve_scored_pairs(working)
-        kwargs = {"t_high": tuned["t_high"], "ratio": tuned["ratio"]} if args.strategy == "threshold" else {}
-        if args.strategy == "top1":
-            kwargs = {"t_high": tuned["t_high"]}
-        test_predictions = select_matches(working, args.strategy, **kwargs)
+        test_predictions = select_matches(
+            working, args.strategy,
+            **_strategy_kwargs(args.strategy, tuned, tuned_tiered, args.max_k),
+        )
         if conflict_stage == "post":
             test_predictions, _ = resolve.resolve_predictions(test_predictions, working)
 

@@ -28,6 +28,7 @@ _PRELIM_WEIGHTS = {
     "addr_char": 0.7,
     "rare_token": 0.8,
     "numeric": 0.5,
+    "embedding": 0.9,
 }
 
 FEATURE_NAMES = [
@@ -41,7 +42,7 @@ FEATURE_NAMES = [
     "country_match", "country_either_missing",
     "name_len_ratio", "addr_len_ratio",
     "name_missing_either", "addr_missing_either",
-    "n_channels_hit", "prelim_score",
+    "n_channels_hit", "prelim_score", "embed_cosine",
     "rank_in_entity", "score_gap_to_top", "score_ratio_to_top",
     "n_candidates", "n_candidates_near_top",
 ]
@@ -170,12 +171,31 @@ def _pair_features(s1, cand, channel_scores, context, name_idf, addr_idf):
         1.0 if (s1.addr_missing or cand.addr_missing) else 0.0,
         float(len(channel_scores)),
         prelim,
+        # filled in afterwards by set_embedding_feature() when embeddings are
+        # enabled; kept in the fixed feature layout either way so the model's
+        # input width never depends on configuration
+        0.0,
         float(rank),
         top_score - prelim,
         prelim / top_score if top_score > 0 else 0.0,
         float(n_cands),
         float(n_near_top),
     ]
+
+
+def set_embedding_feature(X, values):
+    """
+    Write the pre-computed cosine column into an already-built feature matrix.
+
+    Kept separate from build_pair_table because the cosines are computed in a
+    vectorised chunked pass over all pairs at once; doing it per pair inside
+    the Python loop would dominate the runtime.
+    """
+    column = FEATURE_NAMES.index("embed_cosine")
+    if len(values) != len(X):
+        raise ValueError(f"expected {len(X)} cosines, got {len(values)}")
+    X[:, column] = np.asarray(values, dtype=np.float32)
+    return X
 
 
 def build_pair_table(candidates, s1_views, pool_views, name_idf, addr_idf,
