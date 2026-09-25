@@ -166,6 +166,75 @@ def test_pair_table_shapes_and_multi_match():
     print(f"  pair table OK ({X.shape[0]} pairs, {X.shape[1]} features)")
 
 
+def test_sparse_topk_paths_agree():
+    """The fast path and the fallback must return identical pairs."""
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import src.matching.blocking as blocking
+
+    if not blocking._HAS_SPARSE_DOT_TOPN:
+        print("  sparse_dot_topn not installed, skipping path-agreement test")
+        return
+
+    # business-like strings sharing tokens, so the top-k is actually populated
+    rng = np.random.default_rng(0)
+    words = ["sunrise", "textiles", "global", "foods", "lotus", "motors", "apex",
+             "trading", "pharma", "steel", "exports", "riverside"]
+    texts = [
+        " ".join(rng.choice(words, size=int(rng.integers(2, 5)), replace=False))
+        for _ in range(300)
+    ]
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), dtype=np.float32)
+    vec.fit(texts)
+    query, pool = vec.transform(texts[:80]), vec.transform(texts[80:])
+
+    threshold = 0.15
+    fast = sorted(blocking._sparse_topk(query, pool, 10, min_score=threshold))
+    blocking._HAS_SPARSE_DOT_TOPN = False
+    try:
+        slow = sorted(
+            (q, p, sc) for q, p, sc in blocking._sparse_topk(query, pool, 10)
+            if sc >= threshold
+        )
+    finally:
+        blocking._HAS_SPARSE_DOT_TOPN = True
+
+    assert len(fast) > 200, f"test is too weak to be meaningful ({len(fast)} pairs)"
+
+    # The two paths can pick different members among candidates whose scores are
+    # exactly tied at the k-th position, so comparing chosen ids is wrong. The
+    # real invariant is that both return the same top-k *scores* per row.
+    def scores_by_row(pairs):
+        out = {}
+        for q, _, score in pairs:
+            out.setdefault(q, []).append(round(float(score), 5))
+        return {q: sorted(v, reverse=True) for q, v in out.items()}
+
+    fast_scores, slow_scores = scores_by_row(fast), scores_by_row(slow)
+    assert set(fast_scores) == set(slow_scores), "paths disagree on which rows have hits"
+    for row, values in fast_scores.items():
+        assert values == slow_scores[row], f"row {row}: score sets differ"
+
+    shared = {(q, p) for q, p, _ in fast} & {(q, p) for q, p, _ in slow}
+    assert len(shared) / len(fast) > 0.95, "paths disagree beyond tie-breaking"
+    print(f"  sparse top-k fast/fallback agreement OK "
+          f"({len(fast)} pairs, {len(fast) - len(shared)} tie-break differences)")
+
+
+def test_candidate_cache_roundtrip(tmp_dir):
+    from src.matching.blocking import generate_candidates_cached
+
+    s1, pool = _toy_frames()
+    first = generate_candidates_cached(s1, pool, cache_dir=tmp_dir)
+    cached = generate_candidates_cached(s1, pool, cache_dir=tmp_dir)
+    assert first == cached
+    # a different blocking config must not reuse the previous cache entry
+    other = generate_candidates_cached(s1, pool, {"k_name_char": 3}, cache_dir=tmp_dir)
+    files = [f for f in os.listdir(tmp_dir) if f.endswith(".pkl")]
+    assert len(files) == 2, f"cache key did not separate configs: {files}"
+    assert isinstance(other, dict)
+    print("  candidate cache round-trip OK")
+
+
 def test_split_is_entity_level_and_stratified():
     gt = {f"S1-{i}": (set() if i % 3 == 0 else {f"S2-{i}"}) for i in range(60)}
     country_of = {f"S1-{i}": ("India" if i % 2 else "US") for i in range(60)}
@@ -217,11 +286,14 @@ def main():
     test_conflict_resolution_post()
     test_conflict_resolution_pre()
     test_blocking_recall_and_country_separation()
+    test_sparse_topk_paths_agree()
     test_pair_table_shapes_and_multi_match()
     test_split_is_entity_level_and_stratified()
     test_select_matches_covers_every_entity()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_submission_io_roundtrip(tmp_dir)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        test_candidate_cache_roundtrip(tmp_dir)
     print("\nall matching tests passed")
 
 

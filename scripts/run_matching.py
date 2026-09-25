@@ -22,7 +22,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from src.matching import io as match_io
 from src.matching import metrics, resolve, splits
-from src.matching.blocking import channel_contribution, generate_candidates
+from src.matching.blocking import channel_contribution, generate_candidates_cached
 from src.matching.decide import select_matches, tune_threshold
 from src.matching.model import PairwiseMatcher, label_pairs
 from src.matching.pair_features import build_idf, build_pair_table, build_record_views
@@ -124,6 +124,11 @@ def main():
                         choices=("expected_f05", "threshold", "top1"))
     parser.add_argument("--conflict-stage", default="post", choices=("none", "pre", "post"))
     parser.add_argument("--no-ablation", action="store_true")
+    parser.add_argument("--cache-dir", default=None,
+                        help="reuse blocking output across runs; the key covers the data "
+                             "and the blocking config, so it invalidates itself")
+    parser.add_argument("--blocking-threads", type=int, default=-1,
+                        help="threads for the sparse top-k product (-1 = all cores)")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -186,7 +191,10 @@ def main():
     # --- stage A: blocking -------------------------------------------------
     logger.info("generating candidates")
     t0 = time.time()
-    candidates = generate_candidates(s1_df, pool_df)
+    blocking_config = {"n_threads": args.blocking_threads}
+    candidates = generate_candidates_cached(
+        s1_df, pool_df, blocking_config, args.cache_dir, tag="train"
+    )
     report["blocking_seconds"] = time.time() - t0
     logger.info("candidate generation complete in %.1fs", report["blocking_seconds"])
 
@@ -286,7 +294,9 @@ def main():
         test_started = time.time()
         test_s1, test_pool = _load_sources(args.test_dir, "test")
         logger.info("test data loaded | source1=%d pool=%d", len(test_s1), len(test_pool))
-        test_candidates = generate_candidates(test_s1, test_pool)
+        test_candidates = generate_candidates_cached(
+            test_s1, test_pool, blocking_config, args.cache_dir, tag="test"
+        )
         logger.info("test candidate generation complete in %.1fs", time.time() - test_started)
 
         test_s1_views, test_pool_views = build_record_views(test_s1), build_record_views(test_pool)
