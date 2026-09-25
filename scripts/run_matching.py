@@ -19,7 +19,26 @@ import time
 import numpy as np
 import pandas as pd
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+def _project_root():
+    """
+    Locate the directory that holds `src/`, searching upward from this file.
+
+    The repository keeps scripts beside `src/`, while the submission package
+    places them under `src/` so that all source sits there as the challenge
+    requires. Searching upward makes the same file work in both layouts.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.isdir(os.path.join(here, "src", "matching")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    raise RuntimeError("could not locate the project root containing src/matching")
+
+
+sys.path.insert(0, _project_root())
 
 from src.matching import io as match_io
 from src.matching import metrics, resolve, scorecache, splits
@@ -189,6 +208,13 @@ def main():
                              "recall: addr_char 12.4%%, rare_token 0.29%%, numeric 0.24%%, "
                              "name_char 0.20%%, name_word 0.04%%. Pruning the cheap ones "
                              "buys back most of the blocking time.")
+    parser.add_argument("--max-candidates", type=int, default=0,
+                        help="cap candidates kept per Source 1 entity after the channels "
+                             "are unioned (0 = no cap). Smaller candidate sets are ranked "
+                             "higher by the organisers, and featurising plus scoring is "
+                             "linear in this number. Sweep it with scripts/tune_blocking.py")
+    parser.add_argument("--max-df-char", type=float, default=1.0,
+                        help="drop char n-grams appearing in more than this share of the pool")
     parser.add_argument("--max-k", type=int, default=10,
                         help="most matches predictable for one entity")
     parser.add_argument("--embeddings", action="store_true",
@@ -286,6 +312,8 @@ def main():
         "n_threads": args.blocking_threads,
         "channels": channels,
         "embedding_encoder": encoder,
+        "max_candidates": args.max_candidates,
+        "max_df_char": args.max_df_char,
     }
     report["blocking_config"] = {"channels": channels, "embeddings": bool(args.embeddings)}
     logger.info("blocking channels: %s", ", ".join(channels))
@@ -297,6 +325,10 @@ def main():
 
     val_gt = {sid: ground_truth.get(sid, set()) for sid in val_ids}
     report["blocking"] = metrics.blocking_report(candidates, val_gt, len(pool_df))
+    report["candidate_totals"] = {
+        "train_entities": len(candidates),
+        "train_candidate_pairs": sum(len(v) for v in candidates.values()),
+    }
     report["blocking_channels"] = channel_contribution(candidates, val_gt)
     logger.info(
         "blocking: pair recall %.4f | %.1f candidates/entity | reduction %.5f",
@@ -478,6 +510,10 @@ def main():
         )
         match_io.write_candidate_pairs(
             os.path.join(args.output_dir, "candidate_pairs.tsv"), test_ids, test_candidates
+        )
+        report["candidate_totals"]["test_entities"] = len(test_candidates)
+        report["candidate_totals"]["test_candidate_pairs"] = sum(
+            len(v) for v in test_candidates.values()
         )
         report["test"] = {
             "n_entities": len(test_ids),

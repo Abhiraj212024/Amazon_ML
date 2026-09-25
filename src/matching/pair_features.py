@@ -18,18 +18,7 @@ import pandas as pd
 from rapidfuzz import fuzz
 from rapidfuzz.distance import JaroWinkler
 
-from .blocking import CHANNELS
-
-# Weights folded into the preliminary score used for the context features.
-# Name evidence is worth more than address evidence for identity.
-_PRELIM_WEIGHTS = {
-    "name_char": 1.0,
-    "name_word": 0.9,
-    "addr_char": 0.7,
-    "rare_token": 0.8,
-    "numeric": 0.5,
-    "embedding": 0.9,
-}
+from .blocking import CHANNELS, CHANNEL_WEIGHTS, prelim_score
 
 FEATURE_NAMES = [
     "name_ratio", "name_token_set", "name_token_sort", "name_partial", "name_jaro",
@@ -71,11 +60,18 @@ def _containment(a, b):
 
 
 def _idf_overlap(a, b, idf):
-    """Shared tokens weighted by rarity, normalised by the smaller side's mass."""
+    """
+    Shared tokens weighted by rarity, normalised by the smaller side's mass.
+
+    Summed in sorted order because set iteration order over strings varies
+    between processes, and float addition is not associative - an unsorted sum
+    makes the feature value, and therefore the prediction, irreproducible.
+    """
     if not a or not b:
         return 0.0
-    shared = sum(idf.get(t, 0.0) for t in a & b)
-    denom = min(sum(idf.get(t, 0.0) for t in a), sum(idf.get(t, 0.0) for t in b))
+    shared = sum(idf.get(t, 0.0) for t in sorted(a & b))
+    denom = min(sum(idf.get(t, 0.0) for t in sorted(a)),
+                sum(idf.get(t, 0.0) for t in sorted(b)))
     return shared / denom if denom > 0 else 0.0
 
 
@@ -120,13 +116,6 @@ def build_record_views(df):
     ]
     records = df[["entity_id"] + columns].to_dict("records")
     return {r["entity_id"]: RecordView(r) for r in records}
-
-
-def _prelim_score(channel_scores):
-    return max(
-        (_PRELIM_WEIGHTS.get(channel, 0.5) * score for channel, score in channel_scores.items()),
-        default=0.0,
-    )
 
 
 def _pair_features(s1, cand, channel_scores, context, name_idf, addr_idf):
@@ -216,7 +205,7 @@ def build_pair_table(candidates, s1_views, pool_views, name_idf, addr_idf,
             continue
 
         scored = sorted(
-            ((cand_id, chans, _prelim_score(chans)) for cand_id, chans in matches.items()),
+            ((cand_id, chans, prelim_score(chans)) for cand_id, chans in matches.items()),
             key=lambda item: -item[2],
         )
         top_score = scored[0][2]

@@ -152,6 +152,47 @@ Every run reports **calibration** (Brier score plus a reliability table).
 candidate, so a large gap between `mean_predicted` and `observed_rate` is the
 signal that it is abstaining for the wrong reason.
 
+## Candidate-set size
+
+The organisers rank a smaller candidate set per Source 1 entity higher, and it
+is also the dominant cost: once blocking is cached, featurising and scoring are
+**linear in candidates per entity** and account for ~91% of the remaining
+runtime. Both goals point the same way.
+
+```bash
+python3 scripts/tune_blocking.py --train-dir dataset_5pct/train
+```
+
+Sweeps channel sets, per-channel `k`, `max_df` and a post-union cap, and prints
+recall against candidates per entity, plus the smallest candidate set that
+clears each recall floor. `--max-candidates N` then applies the chosen cap;
+because that cut happens before the model runs, the result is still exactly
+"the set the model runs inference over", which is what `candidate_pairs.tsv`
+is defined to be.
+
+### What the cost actually is
+
+Not the TF-IDF vocabulary. Measured on a 20k x 40k block, halving the
+dimension changed nothing, while dropping high-document-frequency n-grams cut
+the time 11x at essentially the same dimension:
+
+| setting | dim | nnz/row | top-k time |
+| --- | --- | --- | --- |
+| baseline | 46,470 | 56.3 | 3.46s |
+| `min_df=3` | 25,308 | 55.5 | 3.60s |
+| `max_df=0.1` | 46,399 | 43.6 | 1.60s |
+| `max_df=0.05` | 46,124 | 17.0 | **0.31s** |
+
+The sparse product costs roughly the sum over terms of `df_query x df_pool`, so
+it scales with **non-zeros per row**, not with vocabulary size. Common n-grams
+carry almost no IDF weight and dominate that sum.
+
+This also means **PCA or any dense projection is the wrong move**: it destroys
+the sparsity the top-k search depends on, turning a sparse product into a dense
+one. `--max-df-char` is the right knob, and it is off by default because on the
+synthetic corpus - whose addresses come from a handful of streets - it cost
+recall. Measure it on real data first.
+
 ## Channel pruning
 
 Measured unique recall on the real data — the share of true pairs *only* that
@@ -385,12 +426,124 @@ Without `--test-dir` validation is reported as SKIPPED rather than as a pass -
 the central rule is that every test Source 1 entity appears exactly once, which
 cannot be checked without the test set.
 
-Pass the challenge's own template with `--documentation` to use it as the base.
-Either way the methodology document gains an auto-generated appendix carrying
-the measured numbers - baseline, blocking recall, channel contribution, the
-ablation, error attribution, calibration - so the prose you write cites real
-results. **The prose itself is yours to write; the scaffold is not a
-submission.**
+### The methodology document
+
+The challenge's `Documentation_template.md` is vendored at
+`docs/Documentation_template.md` and used as the base automatically; override
+with `--documentation`.
+
+Its **measurable** placeholders are filled from the run report: blocking keys,
+candidate pair counts, recall, the feature set, the model, the threshold
+selection method, the macro F_0.5, and the false positive / false negative
+breakdown from the error attribution. Section B gains a full results appendix,
+and Appendix A gains the code layout and entry point.
+
+**The prose is left as prompts on purpose** - the executive summary, problem
+analysis, solution strategy and conclusion are judgement rather than
+measurement, and inventing them would put unverified claims in a document the
+organisers review. The team member list is left blank too.
+
+## One command for a full submission run
+
+```bash
+./scripts/cloud_run.sh --data-dir dataset --team-name your_team
+```
+
+Runs consistency check -> matching -> validation -> packaging, stopping at the
+first failure, because every later step is worthless if an earlier one is
+wrong. Logs and reports land in `<out-dir>/reports/`. Accepts `--channels`,
+`--embeddings`, `--cache-dir` and `--extra "..."` for anything else.
+
+### On SageMaker
+
+A **Processing Job** fits better than a notebook: it is batch, it terminates
+itself, and it stages S3 in and out for you.
+
+```python
+from sagemaker.processing import ScriptProcessor, ProcessingInput, ProcessingOutput
+
+ScriptProcessor(
+    image_uri="<an image with python3 + git>",
+    command=["/bin/bash"],
+    instance_type="ml.r5.4xlarge",   # memory-optimised: memory binds before time
+    instance_count=1, volume_size_in_gb=100, role=role,
+).run(
+    code="scripts/cloud_run.sh",
+    arguments=["--data-dir", "/opt/ml/processing/input",
+               "--out-dir", "/opt/ml/processing/output",
+               "--team-name", "your_team"],
+    inputs=[ProcessingInput(source="s3://bucket/dataset",
+                            destination="/opt/ml/processing/input")],
+    outputs=[ProcessingOutput(source="/opt/ml/processing/output",
+                              destination="s3://bucket/submission")],
+)
+```
+
+Pick an `r` instance rather than a `c` one. GPU buys nothing here except for
+the embedding encoder. Put `--cache-dir` on the mounted volume and keep it
+between runs; re-running without it repeats blocking, scoring and encoding.
+
+### On Kaggle
+
+Workable, with two limits to plan around: a **12-hour** session cap and
+**~20 GB** of writable space in `/kaggle/working`. Attach the challenge files
+as a private Dataset (uploading data you were given is not external data
+lookup - the rule forbids looking entities up in outside sources).
+
+```bash
+!pip install -q sparse_dot_topn rapidfuzz          # internet must be on
+!git clone <your repo> /kaggle/working/repo
+!cd /kaggle/working/repo && ./scripts/cloud_run.sh \
+    --data-dir /kaggle/input/<your-dataset> \
+    --out-dir /kaggle/working/out --team-name your_team
+```
+
+`/kaggle/input` is read-only, so `--out-dir` and `--cache-dir` must point at
+`/kaggle/working`. If a full run will not fit in 12 hours, split it: one
+session to build and save the candidate cache, a second to score from it.
+
+## Full scale: train once, infer in shards
+
+`run_matching.py` does everything in one process, which is fine on a slice and
+impossible on the full data. Measured from the 5% slice, the full training set
+is roughly **2.2M Source 1 records against a 10.3M pool**. Blocking cost grows
+with the *product* of the two sides, so going from 5% to 100% is about **230x**
+the work, and the feature matrix for all ~202M candidate pairs would be ~32 GB.
+A single Kaggle session (12 h, ~30 GB) cannot do it.
+
+The split:
+
+```bash
+# 1. train once, on a capped sample - memory stays flat as the data grows
+python3 scripts/train_model.py \
+    --train-dir dataset/train --bundle model.pkl \
+    --max-fit-entities 150000 --cache-dir .cache
+
+# 2. infer in resumable shards over the full test set
+python3 scripts/predict.py \
+    --bundle model.pkl --test-dir dataset/test \
+    --output-dir output --shards 40
+```
+
+**Training does not need the whole dataset.** At ~90 candidate pairs per
+entity, 150k entities is already ~13M training rows, far past where more helps
+a 39-feature GBDT. `--max-fit-entities` bounds memory regardless of input size,
+and only the entities actually used are blocked.
+
+**Inference cannot be subsampled** - every test Source 1 entity must appear in
+the submission - so it is sharded instead. Each shard is blocked against the
+*whole* pool (sharding the pool would lose candidates), peak memory is set by
+the shard size rather than the dataset, and finished shards are skipped on a
+re-run, so a session that is cut short resumes. Conflict resolution runs
+globally at merge time, because two entities in different shards can claim the
+same record.
+
+`--only-shards 0,1,2` runs a subset, for splitting one run across several
+Kaggle sessions; a later run without it merges whatever is complete and refuses
+to write partial output.
+
+Verified: the sharded path reproduces `run_matching.py`'s `matching_results.tsv`
+exactly, and shard count does not change either output file.
 
 ## Running on a bigger machine
 

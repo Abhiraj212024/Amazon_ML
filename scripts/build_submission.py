@@ -35,7 +35,7 @@ import zipfile
 from datetime import date
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-sys.path.append(REPO_ROOT)
+sys.path.insert(0, REPO_ROOT)
 
 # Everything the pipeline imports at runtime. Pinned from the live environment
 # so the package records what actually produced the outputs.
@@ -45,7 +45,15 @@ RUNTIME_PACKAGES = [
 ]
 OPTIONAL_PACKAGES = ["lightgbm", "sentence-transformers", "hnswlib", "torch"]
 
-CODE_DIRS = ["src", "scripts", "utils"]
+# The spec says "Put all source under src/", so scripts and utils are packaged
+# beneath src/ rather than beside it. The scripts locate the project root by
+# searching upward for src/matching, so they run unchanged in either layout.
+PACKAGED_DIRS = {
+    "src/matching": "src/matching",
+    "src/preprocessing": "src/preprocessing",
+    "scripts": "src/scripts",
+    "utils": "src/utils",
+}
 
 
 def _validate_outputs(output_dir, test_dir):
@@ -137,7 +145,7 @@ Subsampling the sources independently of the ground truth silently caps recall
 at the sampling rate, so verify consistency first:
 
 ```bash
-python3 scripts/diagnose_data.py --train-dir dataset/train
+python3 src/scripts/diagnose_data.py --train-dir dataset/train
 ```
 
 `recall_ceiling` must be ~1.0.
@@ -145,14 +153,14 @@ python3 scripts/diagnose_data.py --train-dir dataset/train
 ## Reproduce the submitted outputs
 
 ```bash
-python3 scripts/run_matching.py \\
+python3 src/scripts/run_matching.py \\
 {chr(10).join(flags)}
 ```
 
 Then validate:
 
 ```bash
-python3 utils/validate_submission.py \\
+python3 src/utils/validate_submission.py \\
     --matching output/matching_results.tsv \\
     --candidate output/candidate_pairs.tsv \\
     --test-dir dataset/test --check-ids
@@ -161,9 +169,15 @@ python3 utils/validate_submission.py \\
 ## Tests
 
 ```bash
-python3 scripts/test_matching.py
-./scripts/preflight.sh
+python3 src/scripts/test_matching.py
 ```
+
+## Layout
+
+All source is under `src/`: `src/matching` and `src/preprocessing` are the
+packages, `src/scripts` the entry points, `src/utils` the standalone helpers.
+The entry points locate the project root by searching upward for
+`src/matching`, so they run from this folder without any path setup.
 """
 
 
@@ -172,7 +186,7 @@ def _methodology_appendix(report):
     if not report:
         return "\n(no run report supplied, so no measured numbers are included)\n"
 
-    lines = ["", "## Appendix: measured results (auto-generated)", "",
+    lines = ["", "### B. Additional Results (auto-generated from the run report)", "",
              "Numbers below are read directly from the run report; the prose above",
              "is written by hand.", ""]
 
@@ -235,6 +249,177 @@ def _methodology_appendix(report):
     return "\n".join(lines) + "\n"
 
 
+VENDORED_TEMPLATE = os.path.join(REPO_ROOT, "docs", "Documentation_template.md")
+
+# Placeholders in the challenge's template that can be answered from a run
+# report. Prose sections (executive summary, problem analysis, conclusion) are
+# deliberately left alone: they are judgement, not measurement.
+def _template_fills(report):
+    blocking = report.get("blocking", {})
+    totals = report.get("candidate_totals", {})
+    best = report.get("best_validation", {})
+    config = report.get("blocking_config", {})
+    channels = config.get("channels", [])
+    errors = {}
+    for row in report.get("ablation", []):
+        if (row.get("strategy"), row.get("conflict_stage")) == (
+            best.get("strategy"), best.get("conflict_stage")
+        ):
+            errors = row.get("errors", {})
+            break
+
+    channel_notes = {
+        "name_char": "char 3-5 gram TF-IDF on the business name",
+        "addr_char": "char 3-5 gram TF-IDF on the address",
+        "name_word": "word-level TF-IDF on the business name",
+        "numeric": "inverted index on numeric address tokens (house / postal numbers)",
+        "rare_token": "IDF-weighted inverted index on rare name tokens",
+        "embedding": "dense sentence-embedding ANN search",
+    }
+    keys = "; ".join(channel_notes.get(c, c) for c in channels) or "not recorded"
+    keys += ". All channels are unioned and blocked by country."
+
+    pairs = totals.get("test_candidate_pairs") or totals.get("train_candidate_pairs")
+    pairs_text = f"{pairs:,}" if pairs else "not recorded"
+    if totals.get("test_candidate_pairs") and totals.get("train_candidate_pairs"):
+        pairs_text = (f"{totals['test_candidate_pairs']:,} on the test set "
+                      f"({totals['train_candidate_pairs']:,} on the training set)")
+
+    model = "gradient-boosted decision trees (LightGBM if available, "\
+            "scikit-learn HistGradientBoosting otherwise), isotonic-calibrated"
+    embedding = report.get("embedding")
+    if embedding:
+        model += f"; dense embeddings from {embedding.get('model')} " \
+                 f"({embedding.get('dimensions')} dimensions)"
+
+    recall_note = (
+        f"Channels are unioned rather than intersected, so a true pair only has to "
+        f"survive one of them. Measured pair recall on the held-out split: "
+        f"{blocking.get('pair_recall', 0):.4f}, at "
+        f"{blocking.get('candidates_per_entity_mean', 0):.1f} candidates per entity "
+        f"and a reduction ratio of {blocking.get('reduction_ratio', 0):.5f}. "
+        f"Per-channel and unique recall are reported in Appendix B, so a channel that "
+        f"earns nothing can be dropped."
+    )
+
+    false_positive = "not recorded"
+    false_negative = "not recorded"
+    if errors:
+        false_positive = (
+            f"{errors.get('false_merge', 0):,} predicted IDs were not true matches, "
+            f"of which {errors.get('singleton_broken', 0):,} were predictions made "
+            f"against true singletons (each scoring 0 for that entity)."
+        )
+        false_negative = (
+            f"{errors.get('lost_in_decision', 0):,} true matches reached the model and "
+            f"were rejected by the decision layer, against "
+            f"{errors.get('lost_in_blocking', 0):,} that blocking never retrieved - so "
+            f"the decision threshold, not blocking recall, is the dominant loss."
+        )
+
+    threshold = (
+        "Direct grid search against macro F_0.5 on a tuning split held out from the "
+        "training entities, separate from the validation split used for reporting. "
+        "The search is vectorised, and it flags a parameter whose optimum is pinned "
+        "to the edge of its range."
+    )
+    tuned = report.get("tuned_tiered") or report.get("tuned_threshold")
+    if tuned:
+        params = ", ".join(f"{k}={v:.2f}" for k, v in tuned.items()
+                           if isinstance(v, float) and k != "macro_f05")
+        if params:
+            threshold += f" Selected: {params}."
+
+    return {
+        "**Approach Type:** [Blocking + Classifier / End-to-End / Graph-Based / Hybrid, etc]":
+            "**Approach Type:** Blocking + Classifier (multi-channel blocking, calibrated "
+            "pairwise GBDT, global conflict resolution, expected-F_0.5 set selection)",
+        "- **Blocking keys used:** [e.g., PIN code, phonetic name encoding, TF-IDF, etc.]":
+            f"- **Blocking keys used:** {keys}",
+        "- **Candidate pairs generated:** [total]":
+            f"- **Candidate pairs generated:** {pairs_text}",
+        "- **How you ensured true matches were not lost:**":
+            f"- **How you ensured true matches were not lost:** {recall_note}",
+        "- Name features: [e.g., Jaccard, Levenshtein, phonetic encoding]":
+            "- Name features: token-set / token-sort / partial ratio, Jaro-Winkler, "
+            "Jaccard and containment over token sets, IDF-weighted token overlap, "
+            "legal-suffix agreement, length ratio",
+        "- Address features: [e.g., token overlap, edit distance, PIN code matching]":
+            "- Address features: the same string similarities over the cleaned address, "
+            "IDF-weighted token overlap, and numeric-token agreement *and conflict* "
+            "(disjoint house/postal numbers are evidence against a match)",
+        "- Other: []":
+            "- Other: country agreement and missingness flags; entity-context features "
+            "(rank within the entity, score gap to the top candidate, number of "
+            "near-ties), which let the model distinguish a clear winner from a "
+            "cluster of ambiguous candidates",
+        "**Model type:** [e.g., XGBoost, Siamese Network, Transformer, etc.]":
+            f"**Model type:** {model}",
+        "**Threshold selection method:** [e.g., F_0.5 optimization on validation set]":
+            f"**Threshold selection method:** {threshold}",
+        "- **F_0.5 Score (macro):** [your best validation score]":
+            f"- **F_0.5 Score (macro):** {best.get('macro_f05', 0):.4f} on the held-out "
+            f"validation split ({best.get('strategy')}, conflict stage "
+            f"{best.get('conflict_stage')}); all-empty baseline "
+            f"{report.get('all_empty_baseline', 0):.4f}",
+        "- **Common false positives (wrong merges):** [brief description]":
+            f"- **Common false positives (wrong merges):** {false_positive}",
+        "- **Common false negatives (missed matches):** [brief description]":
+            f"- **Common false negatives (missed matches):** {false_negative}",
+    }
+
+
+CODE_ARTEFACTS = """
+All source ships under `code/business_entity_resolution/src/`:
+
+| Path | Contents |
+| --- | --- |
+| `src/preprocessing/` | loading, normalisation, name and address cleaning, feature extraction |
+| `src/matching/blocking.py` | multi-channel candidate generation, blocked by country |
+| `src/matching/pair_features.py` | the pairwise feature set |
+| `src/matching/model.py` | calibrated gradient-boosted pairwise classifier |
+| `src/matching/resolve.py` | global conflict resolution |
+| `src/matching/decide.py` | set selection and threshold tuning |
+| `src/matching/metrics.py` | the official metric plus per-stage diagnostics |
+| `src/scripts/` | entry points |
+| `src/utils/` | the challenge's submission validator |
+
+Entry point, which regenerates both output files end to end:
+
+```bash
+python3 src/scripts/run_matching.py \\
+    --train-dir dataset/train --test-dir dataset/test \\
+    --output-dir output --cache-dir .cache
+```
+
+`src/scripts/diagnose_data.py` checks the ground truth and sources are
+consistent before a run, and `src/utils/validate_submission.py` checks both
+output files against the submission rules afterwards.
+"""
+
+
+def fill_template(text, report):
+    '''
+    Answer the template's measurable placeholders from the run report.
+
+    Only fields that are facts about the run are touched. The executive
+    summary, problem analysis, solution strategy and conclusion are left as
+    prompts, because they are judgement rather than measurement and writing
+    them is the author's job.
+    '''
+    filled = 0
+    for placeholder, value in _template_fills(report).items():
+        if placeholder in text:
+            text = text.replace(placeholder, value, 1)
+            filled += 1
+
+    text = text.replace(
+        "### A. Code Artefacts",
+        "### A. Code Artefacts" + CODE_ARTEFACTS, 1,
+    )
+    return text, filled
+
+
 DEFAULT_DOC = """# Methodology
 
 <!-- Replace this scaffold with your own write-up. The appendix below is
@@ -284,6 +469,10 @@ def main():
     parser.add_argument("--documentation", default=None,
                         help="the challenge's Documentation_template.md, used as the base")
     parser.add_argument("--dest", default="dist")
+    parser.add_argument("--wrap-in-folder", action="store_true",
+                        help="nest everything under <team_name>_submission/ inside the zip. "
+                             "Off by default: the spec's tree puts output/, code/ and "
+                             "Documentation_template.md at the root of the archive.")
     parser.add_argument("--skip-validation", action="store_true",
                         help="package even if the validator fails (not recommended)")
     args = parser.parse_args()
@@ -325,7 +514,10 @@ def main():
     archive = os.path.join(args.dest, f"{args.team_name}_submission.zip")
 
     with tempfile.TemporaryDirectory() as staging:
-        root = os.path.join(staging, f"{args.team_name}_submission")
+        # the spec's tree puts output/, code/ and the document at the archive
+        # root, so no wrapper folder unless explicitly asked for
+        root = os.path.join(staging, f"{args.team_name}_submission") if args.wrap_in_folder \
+            else os.path.join(staging, "submission")
         code_root = os.path.join(root, "code", "business_entity_resolution")
         os.makedirs(os.path.join(root, "output"), exist_ok=True)
         os.makedirs(code_root, exist_ok=True)
@@ -333,43 +525,83 @@ def main():
         for name in ("matching_results.tsv", "candidate_pairs.tsv"):
             shutil.copy2(os.path.join(args.output_dir, name), os.path.join(root, "output", name))
 
-        for directory in CODE_DIRS:
-            source = os.path.join(REPO_ROOT, directory)
+        for source_rel, packaged_rel in PACKAGED_DIRS.items():
+            source = os.path.join(REPO_ROOT, source_rel)
             if os.path.isdir(source):
                 shutil.copytree(
-                    source, os.path.join(code_root, directory),
+                    source, os.path.join(code_root, packaged_rel),
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"),
                 )
+        # make src/ a package root even though the subpackages carry __init__
+        init = os.path.join(code_root, "src", "__init__.py")
+        if not os.path.exists(init):
+            with open(init, "w") as handle:
+                handle.write("")
 
         with open(os.path.join(code_root, "requirements.txt"), "w") as handle:
             handle.write(requirements)
         with open(os.path.join(code_root, "README.md"), "w") as handle:
             handle.write(_run_readme(report))
 
-        base_doc = DEFAULT_DOC
-        if args.documentation and os.path.exists(args.documentation):
-            with open(args.documentation) as handle:
+        used_template = False
+        template_path = args.documentation or (
+            VENDORED_TEMPLATE if os.path.exists(VENDORED_TEMPLATE) else None
+        )
+        if template_path and os.path.exists(template_path):
+            with open(template_path) as handle:
                 base_doc = handle.read()
-            print(f"  using {args.documentation} as the documentation base")
+            base_doc, filled = fill_template(base_doc, report)
+            print(f"  filled {filled} measurable fields in {os.path.basename(template_path)}")
+            if args.team_name:
+                base_doc = base_doc.replace("[Your Team Name]", args.team_name, 1)
+            base_doc = base_doc.replace("[Date]", date.today().isoformat(), 1)
+            print("  prose sections (summary, analysis, conclusion) left for you to write")
+            used_template = True
         else:
-            print("  no template supplied; wrote a scaffold you must replace with your write-up")
+            base_doc = DEFAULT_DOC
+            used_template = False
+            print("  no template found; wrote a scaffold you must replace")
         with open(os.path.join(root, "Documentation_template.md"), "w") as handle:
             handle.write(base_doc.rstrip() + "\n" + _methodology_appendix(report))
 
+        base = staging if args.wrap_in_folder else root
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
             for folder, _, files in os.walk(root):
                 for name in sorted(files):
                     full = os.path.join(folder, name)
-                    zf.write(full, os.path.relpath(full, staging))
+                    zf.write(full, os.path.relpath(full, base))
 
     print(f"\n  wrote {archive} ({os.path.getsize(archive):,} bytes)")
     with zipfile.ZipFile(archive) as zf:
         entries = zf.namelist()
     print(f"  {len(entries)} entries\n")
-    for entry in sorted(e for e in entries if e.count("/") <= 3)[:14]:
-        print(f"    {entry}")
 
-    print("\nBefore submitting, replace the methodology scaffold with your own write-up.")
+    prefix = f"{args.team_name}_submission/" if args.wrap_in_folder else ""
+    required = [
+        f"{prefix}output/matching_results.tsv",
+        f"{prefix}output/candidate_pairs.tsv",
+        f"{prefix}code/business_entity_resolution/README.md",
+        f"{prefix}code/business_entity_resolution/requirements.txt",
+        f"{prefix}Documentation_template.md",
+    ]
+    print("  structure required by the challenge:")
+    missing = False
+    for entry in required:
+        present = entry in entries
+        missing = missing or not present
+        print(f"    [{'OK' if present else '--'}] {entry}")
+    source_files = [e for e in entries if f"{prefix}code/business_entity_resolution/src/" in e]
+    print(f"    [{'OK' if source_files else '--'}] "
+          f"code/business_entity_resolution/src/ ({len(source_files)} files)")
+    if missing or not source_files:
+        sys.exit("\nERROR: the archive is missing required entries")
+
+    if used_template:
+        print("\nThe measurable fields in Documentation_template.md are filled from the run.")
+        print("Still yours to write: the executive summary, problem analysis, solution")
+        print("strategy and conclusion, plus the team member list.")
+    else:
+        print("\nBefore submitting, replace the methodology scaffold with your own write-up.")
 
 
 if __name__ == "__main__":

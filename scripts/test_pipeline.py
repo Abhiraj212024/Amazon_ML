@@ -2,7 +2,26 @@ import pandas as pd
 import sys
 import os
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+def _project_root():
+    """
+    Locate the directory that holds `src/`, searching upward from this file.
+
+    The repository keeps scripts beside `src/`, while the submission package
+    places them under `src/` so that all source sits there as the challenge
+    requires. Searching upward makes the same file work in both layouts.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.isdir(os.path.join(here, "src", "preprocessing")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    raise RuntimeError("could not locate the project root containing src/matching")
+
+
+sys.path.insert(0, _project_root())
 from src.preprocessing.pipeline import preprocess_dataframe
 
 def test_preprocessing():

@@ -9,11 +9,31 @@ Run: python3 scripts/test_matching.py
 """
 import os
 import sys
+import textwrap
 
 import numpy as np
 import pandas as pd
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+def _project_root():
+    """
+    Locate the directory that holds `src/`, searching upward from this file.
+
+    The repository keeps scripts beside `src/`, while the submission package
+    places them under `src/` so that all source sits there as the challenge
+    requires. Searching upward makes the same file work in both layouts.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        if os.path.isdir(os.path.join(here, "src", "matching")):
+            return here
+        parent = os.path.dirname(here)
+        if parent == here:
+            break
+        here = parent
+    raise RuntimeError("could not locate the project root containing src/matching")
+
+
+sys.path.insert(0, _project_root())
 
 from src.matching import io as match_io
 from src.matching import metrics, resolve, splits
@@ -623,15 +643,22 @@ def test_submission_package(tmp_dir):
     archive = os.path.join(tmp_dir, "dist", "t_submission.zip")
     with zipfile.ZipFile(archive) as zf:
         names = set(zf.namelist())
-        requirements = zf.read("t_submission/code/business_entity_resolution/requirements.txt").decode()
+        requirements = zf.read("code/business_entity_resolution/requirements.txt").decode()
 
-    for required in ("t_submission/output/matching_results.tsv",
-                     "t_submission/output/candidate_pairs.tsv",
-                     "t_submission/Documentation_template.md",
-                     "t_submission/code/business_entity_resolution/README.md",
-                     "t_submission/code/business_entity_resolution/requirements.txt"):
+    # the spec's tree puts these at the root of the archive, with no wrapper
+    for required in ("output/matching_results.tsv",
+                     "output/candidate_pairs.tsv",
+                     "Documentation_template.md",
+                     "code/business_entity_resolution/README.md",
+                     "code/business_entity_resolution/requirements.txt"):
         assert required in names, f"missing {required}"
-    assert any("/src/matching/" in n for n in names), "source not packaged"
+    # "Put all source under src/": scripts and utils move beneath it
+    assert "code/business_entity_resolution/src/matching/blocking.py" in names
+    assert "code/business_entity_resolution/src/scripts/run_matching.py" in names
+    assert "code/business_entity_resolution/src/utils/validate_submission.py" in names
+    assert not any(n.startswith("code/business_entity_resolution/scripts/") for n in names), (
+        "scripts must live under src/, not beside it"
+    )
     # the challenge asks for pinned dependencies, not ranges
     assert "==" in requirements and ">=" not in requirements, requirements
 
@@ -645,6 +672,188 @@ def test_submission_package(tmp_dir):
     )
     assert refused.returncode != 0, "packaged an invalid submission"
     print("  submission package layout and refusal OK")
+
+
+def test_blocking_is_reproducible_across_processes():
+    """
+    candidate_pairs.tsv is audited by the organisers, so it has to be the same
+    on every run. Set iteration order over strings varies between processes
+    (hash randomisation); because float addition is not associative that
+    changed the accumulated weights slightly and flipped ties at the k-th
+    position, so two identical runs produced different candidate sets.
+
+    This spawns subprocesses with different PYTHONHASHSEED values, which an
+    in-process check cannot do - the seed is fixed once the interpreter starts.
+    """
+    import subprocess
+
+    program = textwrap.dedent(
+        """
+        import json, os, sys
+        sys.path.insert(0, os.environ["PROJECT_ROOT"])
+        import pandas as pd
+        from src.preprocessing.pipeline import preprocess_dataframe
+        from src.matching.blocking import generate_candidates
+
+        rows_s1, rows_pool = [], []
+        for i in range(40):
+            rows_s1.append({"entity_id": f"S1-{i}",
+                            "business_name": f"sunrise textiles {i} pvt ltd",
+                            "business_address": f"{i} mg road pune 411001",
+                            "country": "India"})
+            for j in range(3):
+                rows_pool.append({"entity_id": f"S2-{i}-{j}",
+                                  "business_name": f"sunrise textile {i} private limited",
+                                  "business_address": f"{i} m g rd pune",
+                                  "country": "India"})
+        s1 = preprocess_dataframe(pd.DataFrame(rows_s1))
+        pool = preprocess_dataframe(pd.DataFrame(rows_pool))
+        candidates = generate_candidates(s1, pool, {"k_name_char": 5, "k_addr_char": 5,
+                                                    "k_name_word": 5, "k_numeric": 5,
+                                                    "k_rare_token": 5})
+        print(json.dumps({k: sorted(v) for k, v in sorted(candidates.items())}))
+        """
+    )
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    outputs = []
+    for seed in ("1", "424242"):
+        environment = dict(os.environ, PYTHONHASHSEED=seed, PROJECT_ROOT=root)
+        result = subprocess.run([sys.executable, "-c", program],
+                                capture_output=True, text=True, env=environment)
+        assert result.returncode == 0, result.stderr[-800:]
+        outputs.append(result.stdout.strip())
+
+    assert outputs[0] == outputs[1], (
+        "blocking is not reproducible across processes; candidate_pairs.tsv "
+        "would differ between identical runs"
+    )
+    print("  blocking reproducible across hash seeds OK")
+
+
+def test_documentation_template_filling():
+    """
+    The challenge's template is filled from the run report, but only where the
+    answer is a fact about the run. Prose stays a prompt: writing it is the
+    author's job, and inventing it would put unverified claims in a document
+    the organisers review.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from build_submission import VENDORED_TEMPLATE, fill_template
+
+    assert os.path.exists(VENDORED_TEMPLATE), "the official template is not vendored"
+    with open(VENDORED_TEMPLATE) as handle:
+        template = handle.read()
+
+    report = {
+        "all_empty_baseline": 0.0559,
+        "blocking": {"pair_recall": 0.9816, "candidates_per_entity_mean": 91.5,
+                     "reduction_ratio": 0.9999},
+        "candidate_totals": {"train_candidate_pairs": 10104431,
+                             "test_candidate_pairs": 8000000},
+        "blocking_config": {"channels": ["name_char", "addr_char"]},
+        "best_validation": {"strategy": "tiered", "conflict_stage": "post",
+                            "macro_f05": 0.9614},
+        "ablation": [{"strategy": "tiered", "conflict_stage": "post", "macro_f05": 0.9614,
+                      "errors": {"false_merge": 1239, "singleton_broken": 97,
+                                 "lost_in_decision": 3865, "lost_in_blocking": 1412}}],
+        "tuned_tiered": {"t_first": 0.35, "t_rest": 0.75, "ratio": 0.4, "macro_f05": 0.96},
+    }
+    filled, count = fill_template(template, report)
+
+    assert count >= 10, f"only {count} fields filled"
+    # measurable fields answered with real numbers
+    assert "0.9614" in filled and "0.9816" in filled
+    assert "10,104,431" in filled or "8,000,000" in filled
+    assert "3,865" in filled and "1,412" in filled
+    for placeholder in ("[total]", "[your best validation score]",
+                        "[e.g., XGBoost, Siamese Network, Transformer, etc.]",
+                        "[brief description]"):
+        assert placeholder not in filled, f"left unfilled: {placeholder}"
+    # prose prompts deliberately preserved
+    assert "*Provide a brief 2-3 sentence overview" in filled
+    assert "*Key insights discovered during EDA" in filled
+    assert "### A. Code Artefacts" in filled and "src/matching/blocking.py" in filled
+    print(f"  documentation template filling OK ({count} fields)")
+
+
+def test_blocking_is_shard_invariant():
+    """
+    Inference runs the Source 1 side in shards, so the candidate set must not
+    depend on how it is split. It used to: the TF-IDF vectoriser was fitted on
+    pool + Source 1, so the vocabulary and IDF changed with whichever entities
+    were in the batch, and candidate_pairs.tsv - a file the organisers audit -
+    came out different for different shard counts.
+    """
+    s1, pool = _toy_frames()
+    whole = generate_candidates(s1, pool)
+
+    sharded = {}
+    for start in range(len(s1)):
+        piece = s1.iloc[start:start + 1].reset_index(drop=True)
+        sharded.update(generate_candidates(piece, pool))
+
+    assert set(whole) == set(sharded)
+    for entity_id in whole:
+        assert set(whole[entity_id]) == set(sharded[entity_id]), (
+            f"{entity_id}: candidate set depends on shard boundaries"
+        )
+    print("  blocking is shard-invariant OK")
+
+
+def test_prelim_score_is_not_saturated_by_one_channel():
+    """
+    The inverted-index channels normalise each entity's best hit to 1.0 by
+    construction, so a max over channels is pinned at that channel's weight for
+    a large share of candidates and stops ranking anything. A weighted sum also
+    rewards agreement between independent channels.
+    """
+    from src.matching.blocking import prelim_score
+
+    saturated_single = {"rare_token": 1.0}
+    agreed_moderate = {"name_char": 0.6, "addr_char": 0.6, "name_word": 0.5}
+    assert prelim_score(agreed_moderate) > prelim_score(saturated_single), (
+        "a candidate three channels agree on must outrank one normalised hit"
+    )
+    assert prelim_score({}) == 0.0
+    print("  prelim score rewards channel agreement OK")
+
+
+def test_prune_candidates():
+    """Pruning must keep the strongest candidates and be order-independent."""
+    from src.matching.blocking import prune_candidates
+
+    candidates = {
+        "S1-1": {
+            "keep-a": {"name_char": 0.9, "addr_char": 0.8},   # two channels
+            "keep-b": {"name_char": 0.7, "addr_char": 0.7},   # two channels
+            "drop-a": {"rare_token": 1.0},                    # one saturated hit
+            "drop-b": {"numeric": 1.0},
+        },
+        "S1-2": {"only": {"name_char": 0.5}},
+    }
+    pruned = prune_candidates(candidates, 2)
+    assert set(pruned["S1-1"]) == {"keep-a", "keep-b"}, pruned["S1-1"]
+    assert set(pruned["S1-2"]) == {"only"}, "entities under the cap are untouched"
+
+    # the cap must not depend on insertion order
+    reordered = {"S1-1": dict(reversed(list(candidates["S1-1"].items())))}
+    assert set(prune_candidates(reordered, 2)["S1-1"]) == {"keep-a", "keep-b"}
+
+    assert prune_candidates(candidates, 0) == candidates, "0 means no cap"
+    assert prune_candidates(candidates, None) == candidates
+    print("  candidate pruning OK")
+
+
+def test_max_df_guard_on_small_blocks():
+    """A document-frequency ratio on a handful of records empties the vocabulary."""
+    s1, pool = _toy_frames()
+    aggressive = generate_candidates(s1, pool, {"max_df_char": 0.01, "max_df_word": 0.01})
+    gt = {"S1-1": {"S2-1", "S3-1"}, "S1-2": {"S2-2"}, "S1-3": set()}
+    assert metrics.blocking_report(aggressive, gt, len(pool))["pair_recall"] == 1.0, (
+        "max_df must be ignored on a block too small for the ratio to mean anything"
+    )
+    print("  max_df small-block guard OK")
 
 
 def test_split_is_entity_level_and_stratified():
@@ -701,6 +910,12 @@ def main():
     test_grid_edge_flag_only_when_binding()
     test_calibration_report()
     test_channel_pruning_and_zero_idf_guard()
+    test_blocking_is_reproducible_across_processes()
+    test_blocking_is_shard_invariant()
+    test_prelim_score_is_not_saturated_by_one_channel()
+    test_prune_candidates()
+    test_max_df_guard_on_small_blocks()
+    test_documentation_template_filling()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()
     test_device_resolution()
