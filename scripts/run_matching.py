@@ -316,6 +316,10 @@ def main():
 
     val_gt = {sid: ground_truth.get(sid, set()) for sid in val_ids}
     report["blocking"] = metrics.blocking_report(candidates, val_gt, len(pool_df))
+    report["candidate_totals"] = {
+        "train_entities": len(candidates),
+        "train_candidate_pairs": sum(len(v) for v in candidates.values()),
+    }
     report["blocking_channels"] = channel_contribution(candidates, val_gt)
     logger.info(
         "blocking: pair recall %.4f | %.1f candidates/entity | reduction %.5f",
@@ -497,6 +501,10 @@ def main():
         )
         match_io.write_candidate_pairs(
             os.path.join(args.output_dir, "candidate_pairs.tsv"), test_ids, test_candidates
+        )
+        report["candidate_totals"]["test_entities"] = len(test_candidates)
+        report["candidate_totals"]["test_candidate_pairs"] = sum(
+            len(v) for v in test_candidates.values()
         )
         report["test"] = {
             "n_entities": len(test_ids),

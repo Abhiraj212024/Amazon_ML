@@ -385,12 +385,22 @@ Without `--test-dir` validation is reported as SKIPPED rather than as a pass -
 the central rule is that every test Source 1 entity appears exactly once, which
 cannot be checked without the test set.
 
-Pass the challenge's own template with `--documentation` to use it as the base.
-Either way the methodology document gains an auto-generated appendix carrying
-the measured numbers - baseline, blocking recall, channel contribution, the
-ablation, error attribution, calibration - so the prose you write cites real
-results. **The prose itself is yours to write; the scaffold is not a
-submission.**
+### The methodology document
+
+The challenge's `Documentation_template.md` is vendored at
+`docs/Documentation_template.md` and used as the base automatically; override
+with `--documentation`.
+
+Its **measurable** placeholders are filled from the run report: blocking keys,
+candidate pair counts, recall, the feature set, the model, the threshold
+selection method, the macro F_0.5, and the false positive / false negative
+breakdown from the error attribution. Section B gains a full results appendix,
+and Appendix A gains the code layout and entry point.
+
+**The prose is left as prompts on purpose** - the executive summary, problem
+analysis, solution strategy and conclusion are judgement rather than
+measurement, and inventing them would put unverified claims in a document the
+organisers review. The team member list is left blank too.
 
 ## One command for a full submission run
 

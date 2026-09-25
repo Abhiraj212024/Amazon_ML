@@ -731,6 +731,52 @@ def test_blocking_is_reproducible_across_processes():
     print("  blocking reproducible across hash seeds OK")
 
 
+def test_documentation_template_filling():
+    """
+    The challenge's template is filled from the run report, but only where the
+    answer is a fact about the run. Prose stays a prompt: writing it is the
+    author's job, and inventing it would put unverified claims in a document
+    the organisers review.
+    """
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from build_submission import VENDORED_TEMPLATE, fill_template
+
+    assert os.path.exists(VENDORED_TEMPLATE), "the official template is not vendored"
+    with open(VENDORED_TEMPLATE) as handle:
+        template = handle.read()
+
+    report = {
+        "all_empty_baseline": 0.0559,
+        "blocking": {"pair_recall": 0.9816, "candidates_per_entity_mean": 91.5,
+                     "reduction_ratio": 0.9999},
+        "candidate_totals": {"train_candidate_pairs": 10104431,
+                             "test_candidate_pairs": 8000000},
+        "blocking_config": {"channels": ["name_char", "addr_char"]},
+        "best_validation": {"strategy": "tiered", "conflict_stage": "post",
+                            "macro_f05": 0.9614},
+        "ablation": [{"strategy": "tiered", "conflict_stage": "post", "macro_f05": 0.9614,
+                      "errors": {"false_merge": 1239, "singleton_broken": 97,
+                                 "lost_in_decision": 3865, "lost_in_blocking": 1412}}],
+        "tuned_tiered": {"t_first": 0.35, "t_rest": 0.75, "ratio": 0.4, "macro_f05": 0.96},
+    }
+    filled, count = fill_template(template, report)
+
+    assert count >= 10, f"only {count} fields filled"
+    # measurable fields answered with real numbers
+    assert "0.9614" in filled and "0.9816" in filled
+    assert "10,104,431" in filled or "8,000,000" in filled
+    assert "3,865" in filled and "1,412" in filled
+    for placeholder in ("[total]", "[your best validation score]",
+                        "[e.g., XGBoost, Siamese Network, Transformer, etc.]",
+                        "[brief description]"):
+        assert placeholder not in filled, f"left unfilled: {placeholder}"
+    # prose prompts deliberately preserved
+    assert "*Provide a brief 2-3 sentence overview" in filled
+    assert "*Key insights discovered during EDA" in filled
+    assert "### A. Code Artefacts" in filled and "src/matching/blocking.py" in filled
+    print(f"  documentation template filling OK ({count} fields)")
+
+
 def test_split_is_entity_level_and_stratified():
     gt = {f"S1-{i}": (set() if i % 3 == 0 else {f"S2-{i}"}) for i in range(60)}
     country_of = {f"S1-{i}": ("India" if i % 2 else "US") for i in range(60)}
@@ -786,6 +832,7 @@ def main():
     test_calibration_report()
     test_channel_pruning_and_zero_idf_guard()
     test_blocking_is_reproducible_across_processes()
+    test_documentation_template_filling()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()
     test_device_resolution()
