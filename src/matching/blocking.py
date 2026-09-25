@@ -41,6 +41,78 @@ except ImportError:  # pragma: no cover - depends on the environment
 
 CHANNELS = ("name_char", "addr_char", "name_word", "numeric", "rare_token", "embedding")
 
+# Weights folded into the cheap score used to rank candidates before the model
+# sees them. Name evidence is worth more than address evidence for identity.
+# Defined here rather than in pair_features so both the pruning step and the
+# feature builder use one definition.
+CHANNEL_WEIGHTS = {
+    "name_char": 1.0,
+    "name_word": 0.9,
+    "embedding": 0.9,
+    "rare_token": 0.8,
+    "addr_char": 0.7,
+    "numeric": 0.5,
+}
+
+
+def prelim_score(channel_scores):
+    """
+    Cheap pre-model score for one candidate, from its per-channel hits.
+
+    A weighted *sum*, not a max. The inverted-index channels normalise each
+    entity's best hit to 1.0 by construction, so a max is pinned at that
+    channel's weight for a large share of candidates and stops discriminating:
+    measured on a synthetic corpus, 86% of rare_token and 63% of name_char
+    scores were exactly 1.0. A sum also rewards agreement between channels,
+    which is the signal that a candidate is worth scoring.
+    """
+    return sum(
+        CHANNEL_WEIGHTS.get(channel, 0.5) * score
+        for channel, score in channel_scores.items()
+    )
+
+
+def _prune_key(channel_scores, candidate_id):
+    """
+    Ordering used when cutting a candidate list down.
+
+    Number of channels first: a pair several independent channels agree on is
+    far likelier to be a true match than one a single channel scored highly.
+    Ties broken by candidate id so the result never depends on dict ordering.
+    """
+    return (len(channel_scores), prelim_score(channel_scores), str(candidate_id))
+
+
+def prune_candidates(candidates, max_per_entity):
+    """
+    Keep only the best `max_per_entity` candidates for each Source 1 entity.
+
+    The union of several top-k channels is deliberately generous, which costs
+    twice over: the organisers rank a smaller candidate set higher, and
+    featurising plus scoring is linear in candidates per entity, so it is the
+    dominant cost once blocking is cached.
+
+    Ranking by the cheap combined score and cutting is a real filtering stage,
+    and the result is still "the exact set the model runs inference over",
+    which is what candidate_pairs.tsv is defined to be.
+
+    Ties are broken by candidate id so the result does not depend on dict
+    ordering.
+    """
+    if not max_per_entity or max_per_entity <= 0:
+        return candidates
+
+    pruned = {}
+    for s1_id, matches in candidates.items():
+        if len(matches) <= max_per_entity:
+            pruned[s1_id] = matches
+            continue
+        ranked = sorted(
+            matches.items(), key=lambda item: _prune_key(item[1], item[0]), reverse=True
+        )
+        pruned[s1_id] = dict(ranked[:max_per_entity])
+    return pruned
+
 
 def _text(df, column):
     """Column as a list of plain strings, with missing values as ''."""
@@ -93,16 +165,21 @@ def _sparse_topk(query, pool, k, min_score=0.0, max_dense_cells=4_000_000, n_thr
 
 
 def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score,
-                   n_threads=-1):
+                   n_threads=-1, max_df=1.0, max_df_min_docs=1000):
     """One TF-IDF channel: fit on both sides together, then top-k per S1 row."""
     s1_text, pool_text = _text(s1_df, column), _text(pool_df, column)
     if not any(s1_text) or not any(pool_text):
         return {}
 
+    # applying a ratio to a handful of documents empties the vocabulary
+    if len(pool_text) < max_df_min_docs:
+        max_df = 1.0
+
     vectorizer = TfidfVectorizer(
         analyzer=analyzer,
         ngram_range=ngram_range,
         min_df=1,
+        max_df=max_df,
         sublinear_tf=True,
         dtype=np.float32,
     )
@@ -244,6 +321,25 @@ def generate_candidates(s1_df, pool_df, config=None):
         "numeric_max_df_ratio": 0.05,
         "rare_token_max_df_ratio": 0.05,
         "n_threads": -1,
+        # Character n-grams appearing in a large share of the pool carry little
+        # IDF weight but dominate the cost of the sparse product, which scales
+        # with non-zeros rather than vocabulary size: on an isolated benchmark
+        # max_df=0.05 cut non-zeros per row from 56 to 17 and the top-k from
+        # 3.46s to 0.31s.
+        #
+        # Left OFF by default all the same. On the synthetic corpus, whose
+        # addresses are drawn from a handful of streets, the same setting cost
+        # 7 points of recall, because there a common n-gram really is
+        # discriminative. Whether that holds on real, diverse addresses has to
+        # be measured - scripts/tune_blocking.py sweeps it.
+        "max_df_char": 1.0,
+        "max_df_word": 1.0,
+        # a document-frequency *ratio* is meaningless on a tiny block, where it
+        # can round down to zero and empty the vocabulary
+        "max_df_min_docs": 1000,
+        # Cap on the candidates kept per entity after the channels are unioned.
+        # None keeps everything.
+        "max_candidates": None,
         # Which channels to run. Measured unique recall on the real data was
         # addr_char 12.4%, rare_token 0.29%, numeric 0.24%, name_char 0.20%,
         # name_word 0.04%, while rare_token was the single slowest channel.
@@ -295,14 +391,17 @@ def generate_candidates(s1_df, pool_df, config=None):
             "name_char": lambda: _tfidf_channel(
                 s1_block, pool_block, name_column, cfg["k_name_char"],
                 "char_wb", (3, 5), cfg["min_score_char"], cfg["n_threads"],
+                cfg["max_df_char"], cfg["max_df_min_docs"],
             ),
             "addr_char": lambda: _tfidf_channel(
                 s1_block, pool_block, "business_address_clean", cfg["k_addr_char"],
                 "char_wb", (3, 5), cfg["min_score_char"], cfg["n_threads"],
+                cfg["max_df_char"], cfg["max_df_min_docs"],
             ),
             "name_word": lambda: _tfidf_channel(
                 s1_block, pool_block, name_column, cfg["k_name_word"],
                 "word", (1, 1), cfg["min_score_word"], cfg["n_threads"],
+                cfg["max_df_word"], cfg["max_df_min_docs"],
             ),
             "numeric": lambda: _inverted_index_channel(
                 _numeric_tokens(s1_block), _numeric_tokens(pool_block),
@@ -356,7 +455,17 @@ def generate_candidates(s1_df, pool_df, config=None):
             ", ".join(f"{c}={t:.1f}" for c, t in sorted(timings.items(), key=lambda kv: -kv[1])),
         )
     generate_candidates.last_timings = dict(timings)
-    return {sid: dict(matches) for sid, matches in candidates.items()}
+    result = {sid: dict(matches) for sid, matches in candidates.items()}
+
+    if cfg["max_candidates"]:
+        before = sum(len(v) for v in result.values()) / max(len(result), 1)
+        result = prune_candidates(result, cfg["max_candidates"])
+        after = sum(len(v) for v in result.values()) / max(len(result), 1)
+        logger.info(
+            "pruned candidates to the top %d per entity: %.1f -> %.1f per entity",
+            cfg["max_candidates"], before, after,
+        )
+    return result
 
 
 def channel_contribution(candidates, ground_truth):

@@ -801,6 +801,61 @@ def test_blocking_is_shard_invariant():
     print("  blocking is shard-invariant OK")
 
 
+def test_prelim_score_is_not_saturated_by_one_channel():
+    """
+    The inverted-index channels normalise each entity's best hit to 1.0 by
+    construction, so a max over channels is pinned at that channel's weight for
+    a large share of candidates and stops ranking anything. A weighted sum also
+    rewards agreement between independent channels.
+    """
+    from src.matching.blocking import prelim_score
+
+    saturated_single = {"rare_token": 1.0}
+    agreed_moderate = {"name_char": 0.6, "addr_char": 0.6, "name_word": 0.5}
+    assert prelim_score(agreed_moderate) > prelim_score(saturated_single), (
+        "a candidate three channels agree on must outrank one normalised hit"
+    )
+    assert prelim_score({}) == 0.0
+    print("  prelim score rewards channel agreement OK")
+
+
+def test_prune_candidates():
+    """Pruning must keep the strongest candidates and be order-independent."""
+    from src.matching.blocking import prune_candidates
+
+    candidates = {
+        "S1-1": {
+            "keep-a": {"name_char": 0.9, "addr_char": 0.8},   # two channels
+            "keep-b": {"name_char": 0.7, "addr_char": 0.7},   # two channels
+            "drop-a": {"rare_token": 1.0},                    # one saturated hit
+            "drop-b": {"numeric": 1.0},
+        },
+        "S1-2": {"only": {"name_char": 0.5}},
+    }
+    pruned = prune_candidates(candidates, 2)
+    assert set(pruned["S1-1"]) == {"keep-a", "keep-b"}, pruned["S1-1"]
+    assert set(pruned["S1-2"]) == {"only"}, "entities under the cap are untouched"
+
+    # the cap must not depend on insertion order
+    reordered = {"S1-1": dict(reversed(list(candidates["S1-1"].items())))}
+    assert set(prune_candidates(reordered, 2)["S1-1"]) == {"keep-a", "keep-b"}
+
+    assert prune_candidates(candidates, 0) == candidates, "0 means no cap"
+    assert prune_candidates(candidates, None) == candidates
+    print("  candidate pruning OK")
+
+
+def test_max_df_guard_on_small_blocks():
+    """A document-frequency ratio on a handful of records empties the vocabulary."""
+    s1, pool = _toy_frames()
+    aggressive = generate_candidates(s1, pool, {"max_df_char": 0.01, "max_df_word": 0.01})
+    gt = {"S1-1": {"S2-1", "S3-1"}, "S1-2": {"S2-2"}, "S1-3": set()}
+    assert metrics.blocking_report(aggressive, gt, len(pool))["pair_recall"] == 1.0, (
+        "max_df must be ignored on a block too small for the ratio to mean anything"
+    )
+    print("  max_df small-block guard OK")
+
+
 def test_split_is_entity_level_and_stratified():
     gt = {f"S1-{i}": (set() if i % 3 == 0 else {f"S2-{i}"}) for i in range(60)}
     country_of = {f"S1-{i}": ("India" if i % 2 else "US") for i in range(60)}
@@ -857,6 +912,9 @@ def main():
     test_channel_pruning_and_zero_idf_guard()
     test_blocking_is_reproducible_across_processes()
     test_blocking_is_shard_invariant()
+    test_prelim_score_is_not_saturated_by_one_channel()
+    test_prune_candidates()
+    test_max_df_guard_on_small_blocks()
     test_documentation_template_filling()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()

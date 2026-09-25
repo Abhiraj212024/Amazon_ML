@@ -208,6 +208,13 @@ def main():
                              "recall: addr_char 12.4%%, rare_token 0.29%%, numeric 0.24%%, "
                              "name_char 0.20%%, name_word 0.04%%. Pruning the cheap ones "
                              "buys back most of the blocking time.")
+    parser.add_argument("--max-candidates", type=int, default=0,
+                        help="cap candidates kept per Source 1 entity after the channels "
+                             "are unioned (0 = no cap). Smaller candidate sets are ranked "
+                             "higher by the organisers, and featurising plus scoring is "
+                             "linear in this number. Sweep it with scripts/tune_blocking.py")
+    parser.add_argument("--max-df-char", type=float, default=1.0,
+                        help="drop char n-grams appearing in more than this share of the pool")
     parser.add_argument("--max-k", type=int, default=10,
                         help="most matches predictable for one entity")
     parser.add_argument("--embeddings", action="store_true",
@@ -305,6 +312,8 @@ def main():
         "n_threads": args.blocking_threads,
         "channels": channels,
         "embedding_encoder": encoder,
+        "max_candidates": args.max_candidates,
+        "max_df_char": args.max_df_char,
     }
     report["blocking_config"] = {"channels": channels, "embeddings": bool(args.embeddings)}
     logger.info("blocking channels: %s", ", ".join(channels))

@@ -152,6 +152,47 @@ Every run reports **calibration** (Brier score plus a reliability table).
 candidate, so a large gap between `mean_predicted` and `observed_rate` is the
 signal that it is abstaining for the wrong reason.
 
+## Candidate-set size
+
+The organisers rank a smaller candidate set per Source 1 entity higher, and it
+is also the dominant cost: once blocking is cached, featurising and scoring are
+**linear in candidates per entity** and account for ~91% of the remaining
+runtime. Both goals point the same way.
+
+```bash
+python3 scripts/tune_blocking.py --train-dir dataset_5pct/train
+```
+
+Sweeps channel sets, per-channel `k`, `max_df` and a post-union cap, and prints
+recall against candidates per entity, plus the smallest candidate set that
+clears each recall floor. `--max-candidates N` then applies the chosen cap;
+because that cut happens before the model runs, the result is still exactly
+"the set the model runs inference over", which is what `candidate_pairs.tsv`
+is defined to be.
+
+### What the cost actually is
+
+Not the TF-IDF vocabulary. Measured on a 20k x 40k block, halving the
+dimension changed nothing, while dropping high-document-frequency n-grams cut
+the time 11x at essentially the same dimension:
+
+| setting | dim | nnz/row | top-k time |
+| --- | --- | --- | --- |
+| baseline | 46,470 | 56.3 | 3.46s |
+| `min_df=3` | 25,308 | 55.5 | 3.60s |
+| `max_df=0.1` | 46,399 | 43.6 | 1.60s |
+| `max_df=0.05` | 46,124 | 17.0 | **0.31s** |
+
+The sparse product costs roughly the sum over terms of `df_query x df_pool`, so
+it scales with **non-zeros per row**, not with vocabulary size. Common n-grams
+carry almost no IDF weight and dominate that sum.
+
+This also means **PCA or any dense projection is the wrong move**: it destroys
+the sparsity the top-k search depends on, turning a sparse product into a dense
+one. `--max-df-char` is the right knob, and it is off by default because on the
+synthetic corpus - whose addresses come from a handful of streets - it cost
+recall. Measure it on real data first.
+
 ## Channel pruning
 
 Measured unique recall on the real data — the share of true pairs *only* that

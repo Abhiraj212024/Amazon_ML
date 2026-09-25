@@ -93,6 +93,9 @@ def main():
     parser.add_argument("--conflict-stage", default="post", choices=("none", "pre", "post"))
     parser.add_argument("--channels", default=None)
     parser.add_argument("--max-k", type=int, default=10)
+    parser.add_argument("--max-candidates", type=int, default=0,
+                        help="cap candidates per entity after the union (0 = no cap)")
+    parser.add_argument("--max-df-char", type=float, default=1.0)
     parser.add_argument("--blocking-threads", type=int, default=-1)
     parser.add_argument("--embeddings", action="store_true")
     parser.add_argument("--embedding-model", default=None)
@@ -157,7 +160,9 @@ def main():
                                 device=args.embedding_device)
 
     blocking_config = {"n_threads": args.blocking_threads, "channels": channels,
-                       "embedding_encoder": encoder}
+                       "embedding_encoder": encoder,
+                       "max_candidates": args.max_candidates,
+                       "max_df_char": args.max_df_char}
 
     # Only the entities actually used are blocked: blocking the full training
     # Source 1 would dominate the runtime for rows the model never sees.
