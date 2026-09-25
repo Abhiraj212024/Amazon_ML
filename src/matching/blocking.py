@@ -107,7 +107,13 @@ def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score,
         dtype=np.float32,
     )
     try:
-        vectorizer.fit(s1_text + pool_text)
+        # Fitted on the pool alone, not on pool + Source 1. The pool is what is
+        # being searched, so its statistics are the right ones - and, crucially,
+        # they do not change when the Source 1 side is processed in shards.
+        # Fitting on both made the vocabulary and IDF depend on which entities
+        # happened to be in the batch, so candidate_pairs.tsv came out different
+        # for different shard counts, on a file the organisers audit.
+        vectorizer.fit(pool_text)
         s1_matrix = vectorizer.transform(s1_text)
         pool_matrix = vectorizer.transform(pool_text)
     except ValueError:

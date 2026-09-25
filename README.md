@@ -461,6 +461,49 @@ lookup - the rule forbids looking entities up in outside sources).
 `/kaggle/working`. If a full run will not fit in 12 hours, split it: one
 session to build and save the candidate cache, a second to score from it.
 
+## Full scale: train once, infer in shards
+
+`run_matching.py` does everything in one process, which is fine on a slice and
+impossible on the full data. Measured from the 5% slice, the full training set
+is roughly **2.2M Source 1 records against a 10.3M pool**. Blocking cost grows
+with the *product* of the two sides, so going from 5% to 100% is about **230x**
+the work, and the feature matrix for all ~202M candidate pairs would be ~32 GB.
+A single Kaggle session (12 h, ~30 GB) cannot do it.
+
+The split:
+
+```bash
+# 1. train once, on a capped sample - memory stays flat as the data grows
+python3 scripts/train_model.py \
+    --train-dir dataset/train --bundle model.pkl \
+    --max-fit-entities 150000 --cache-dir .cache
+
+# 2. infer in resumable shards over the full test set
+python3 scripts/predict.py \
+    --bundle model.pkl --test-dir dataset/test \
+    --output-dir output --shards 40
+```
+
+**Training does not need the whole dataset.** At ~90 candidate pairs per
+entity, 150k entities is already ~13M training rows, far past where more helps
+a 39-feature GBDT. `--max-fit-entities` bounds memory regardless of input size,
+and only the entities actually used are blocked.
+
+**Inference cannot be subsampled** - every test Source 1 entity must appear in
+the submission - so it is sharded instead. Each shard is blocked against the
+*whole* pool (sharding the pool would lose candidates), peak memory is set by
+the shard size rather than the dataset, and finished shards are skipped on a
+re-run, so a session that is cut short resumes. Conflict resolution runs
+globally at merge time, because two entities in different shards can claim the
+same record.
+
+`--only-shards 0,1,2` runs a subset, for splitting one run across several
+Kaggle sessions; a later run without it merges whatever is complete and refuses
+to write partial output.
+
+Verified: the sharded path reproduces `run_matching.py`'s `matching_results.tsv`
+exactly, and shard count does not change either output file.
+
 ## Running on a bigger machine
 
 Training does not need the full data - the fit slice is already ample - but

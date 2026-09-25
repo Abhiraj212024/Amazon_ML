@@ -777,6 +777,30 @@ def test_documentation_template_filling():
     print(f"  documentation template filling OK ({count} fields)")
 
 
+def test_blocking_is_shard_invariant():
+    """
+    Inference runs the Source 1 side in shards, so the candidate set must not
+    depend on how it is split. It used to: the TF-IDF vectoriser was fitted on
+    pool + Source 1, so the vocabulary and IDF changed with whichever entities
+    were in the batch, and candidate_pairs.tsv - a file the organisers audit -
+    came out different for different shard counts.
+    """
+    s1, pool = _toy_frames()
+    whole = generate_candidates(s1, pool)
+
+    sharded = {}
+    for start in range(len(s1)):
+        piece = s1.iloc[start:start + 1].reset_index(drop=True)
+        sharded.update(generate_candidates(piece, pool))
+
+    assert set(whole) == set(sharded)
+    for entity_id in whole:
+        assert set(whole[entity_id]) == set(sharded[entity_id]), (
+            f"{entity_id}: candidate set depends on shard boundaries"
+        )
+    print("  blocking is shard-invariant OK")
+
+
 def test_split_is_entity_level_and_stratified():
     gt = {f"S1-{i}": (set() if i % 3 == 0 else {f"S2-{i}"}) for i in range(60)}
     country_of = {f"S1-{i}": ("India" if i % 2 else "US") for i in range(60)}
@@ -832,6 +856,7 @@ def main():
     test_calibration_report()
     test_channel_pruning_and_zero_idf_guard()
     test_blocking_is_reproducible_across_processes()
+    test_blocking_is_shard_invariant()
     test_documentation_template_filling()
     test_embedding_channel_and_cosines()
     test_ann_recall_against_exact()
