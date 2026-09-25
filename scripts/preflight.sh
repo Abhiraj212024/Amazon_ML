@@ -9,10 +9,45 @@
 #
 # Exit code 0 means safe to launch. Any non-zero means fix it locally first.
 
+# --- shell guards -------------------------------------------------------
+# These run BEFORE `set -u`, because probing BASH_SOURCE under `set -u` in a
+# non-bash shell is itself an error.
+
+# Sourcing runs this in the caller's shell, so the bash shebang is ignored and
+# bash-only features (BASH_SOURCE, PIPESTATUS) are missing. Worse, the repo-root
+# lookup below then resolves to "/" and every path is wrong. Refuse instead.
+_preflight_sourced=0
+if [ -n "${ZSH_VERSION:-}" ]; then
+    case "${ZSH_EVAL_CONTEXT:-}" in *:file*) _preflight_sourced=1 ;; esac
+elif [ -n "${BASH_VERSION:-}" ]; then
+    [ "${BASH_SOURCE[0]}" != "$0" ] && _preflight_sourced=1
+fi
+if [ "$_preflight_sourced" -eq 1 ]; then
+    printf 'error: run this script, do not source it:\n\n    ./scripts/preflight.sh\n\n' >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+# Run under another shell (zsh, dash, ksh)? Re-exec with bash. Safe now that we
+# know we are not sourced, so exec cannot replace the user's interactive shell.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    fi
+    printf 'error: this script needs bash, which was not found on PATH\n' >&2
+    exit 1
+fi
+
 set -uo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$REPO_ROOT"
+_script_path="${BASH_SOURCE[0]:-$0}"
+REPO_ROOT="$(cd "$(dirname "$_script_path")/.." 2>/dev/null && pwd)"
+# Never run from a wrongly-resolved root: prove it is actually the repo.
+if [ -z "$REPO_ROOT" ] || [ ! -f "$REPO_ROOT/scripts/run_matching.py" ]; then
+    printf 'error: could not locate the repository root from %s\n' "$_script_path" >&2
+    printf '       run it as ./scripts/preflight.sh from a checkout\n' >&2
+    exit 1
+fi
+cd "$REPO_ROOT" || exit 1
 
 PYTHON="${PYTHON:-python3}"
 DATA_DIR=""
@@ -52,6 +87,7 @@ while [ $# -gt 0 ]; do
 done
 
 cleanup() {
+    rm -f "${TEST_LOG:-}" "${PRE_LOG:-}" 2>/dev/null
     if [ -n "$WORK_DIR" ] && [ "$KEEP" -eq 0 ] && [ -d "$WORK_DIR" ]; then
         rm -rf "$WORK_DIR"
     elif [ -n "$WORK_DIR" ] && [ "$KEEP" -eq 1 ]; then
@@ -72,8 +108,8 @@ if ! command -v "$PYTHON" >/dev/null 2>&1; then
 fi
 ok "$("$PYTHON" --version 2>&1)"
 
-DEP_LOG="$(mktemp -t preflight_deps_XXXXXX)"
-"$PYTHON" - <<'PYEOF' | tee "$DEP_LOG"
+DEP_LOG="$(mktemp "${TMPDIR:-/tmp}/preflight_deps_XXXXXX")"
+"$PYTHON" - >"$DEP_LOG" 2>&1 <<'PYEOF' 
 import importlib, sys
 required = ["numpy", "pandas", "sklearn", "scipy", "rapidfuzz"]
 optional = {"sparse_dot_topn": "blocking runs ~20x slower without it",
@@ -95,7 +131,8 @@ for name, note in optional.items():
         print(f"  [WARN] {name} is missing - {note}")
 sys.exit(1 if missing else 0)
 PYEOF
-DEP_STATUS=${PIPESTATUS[0]}
+DEP_STATUS=$?
+cat "$DEP_LOG"
 WARNINGS=$((WARNINGS + $(grep -c '\[WARN\]' "$DEP_LOG")))
 rm -f "$DEP_LOG"
 if [ "$DEP_STATUS" -ne 0 ]; then
@@ -117,19 +154,22 @@ PYEOF
 # --------------------------------------------------------------------------
 section "Unit tests"
 
-if "$PYTHON" scripts/test_matching.py >/tmp/preflight_tests.log 2>&1; then
-    ok "matching tests passed ($(grep -c 'OK$' /tmp/preflight_tests.log) checks)"
+TEST_LOG="$(mktemp "${TMPDIR:-/tmp}/preflight_tests_XXXXXX")"
+PRE_LOG="$(mktemp "${TMPDIR:-/tmp}/preflight_pre_XXXXXX")"
+
+if "$PYTHON" scripts/test_matching.py >"$TEST_LOG" 2>&1; then
+    ok "matching tests passed ($(grep -c 'OK$' $TEST_LOG) checks)"
 else
     fail "matching tests FAILED"
-    tail -20 /tmp/preflight_tests.log | sed 's/^/      /'
+    tail -20 $TEST_LOG | sed 's/^/      /'
 fi
 
 if [ -f scripts/test_pipeline.py ]; then
-    if "$PYTHON" scripts/test_pipeline.py >/tmp/preflight_pre.log 2>&1; then
+    if "$PYTHON" scripts/test_pipeline.py >"$PRE_LOG" 2>&1; then
         ok "preprocessing tests passed"
     else
         fail "preprocessing tests FAILED"
-        tail -20 /tmp/preflight_pre.log | sed 's/^/      /'
+        tail -20 $PRE_LOG | sed 's/^/      /'
     fi
 fi
 
@@ -137,7 +177,7 @@ fi
 if [ "$QUICK" -eq 0 ]; then
     section "End-to-end smoke test (synthetic data)"
 
-    WORK_DIR="$(mktemp -d -t preflight_XXXXXX)"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/preflight_XXXXXX")"
     SYNTH="$WORK_DIR/data"
     OUT="$WORK_DIR/output"
 
@@ -214,7 +254,7 @@ if [ -n "$DATA_DIR" ]; then
     if [ ! -d "$DATA_DIR" ]; then
         fail "directory not found: $DATA_DIR"
     else
-        DIAG_LOG="$(mktemp -t preflight_diag_XXXXXX)"
+        DIAG_LOG="$(mktemp "${TMPDIR:-/tmp}/preflight_diag_XXXXXX")"
         if "$PYTHON" scripts/diagnose_data.py --train-dir "$DATA_DIR" \
                 >"$DIAG_LOG" 2>&1; then
             grep -E '"(recall_ceiling|singleton_rate|unwinnable_rate|source1_records|pool_records)"' \
@@ -255,16 +295,17 @@ else
 fi
 
 # --------------------------------------------------------------------------
-printf '\n%s%s%s\n' "$BOLD" "$(printf '=%.0s' {1..62})" "$RESET"
+RULE="=============================================================="
+printf '\n%s%s%s\n' "$BOLD" "$RULE" "$RESET"
 if [ "$FAILURES" -eq 0 ]; then
     printf '%sPREFLIGHT PASSED%s  (%d warnings)\n' "$GREEN" "$RESET" "$WARNINGS"
     printf 'Safe to launch on Kaggle or AWS.\n'
-    printf '%s\n' "$(printf '=%.0s' {1..62})"
+    printf '%s\n' "$RULE"
     exit 0
 else
     printf '%sPREFLIGHT FAILED%s  (%d failures, %d warnings)\n' \
         "$RED" "$RESET" "$FAILURES" "$WARNINGS"
     printf 'Fix these locally before spending compute.\n'
-    printf '%s\n' "$(printf '=%.0s' {1..62})"
+    printf '%s\n' "$RULE"
     exit 1
 fi
