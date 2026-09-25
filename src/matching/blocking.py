@@ -39,7 +39,7 @@ try:
 except ImportError:  # pragma: no cover - depends on the environment
     _HAS_SPARSE_DOT_TOPN = False
 
-CHANNELS = ("name_char", "addr_char", "name_word", "numeric", "rare_token")
+CHANNELS = ("name_char", "addr_char", "name_word", "numeric", "rare_token", "embedding")
 
 
 def _text(df, column):
@@ -167,10 +167,30 @@ def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
         scored.sort(key=lambda item: -item[1])
         top = scored[:k]
         if top:
-            # normalise so the score is comparable across entities
+            # normalise so the score is comparable across entities; guard the
+            # degenerate case where every shared token has zero idf, which
+            # would otherwise divide by zero and emit NaN scores
             best = top[0][1]
-            hits[qi] = {pi: float(w / best) for pi, w in top}
+            if best > 0:
+                hits[qi] = {pi: float(w / best) for pi, w in top}
     return hits
+
+
+def _embedding_channel(s1_df, pool_df, encoder, k, min_score, n_threads):
+    """
+    Dense-similarity channel. Imported lazily so the optional embedding
+    dependencies are only required when this channel is actually enabled.
+    """
+    if encoder is None:
+        raise ValueError(
+            "the 'embedding' channel needs an encoder; pass one as "
+            "config['embedding_encoder']"
+        )
+    from .embeddings import embedding_topk, serialise_records
+
+    query = encoder.encode(serialise_records(s1_df))
+    pool = encoder.encode(serialise_records(pool_df))
+    return embedding_topk(query, pool, k=k, min_score=min_score, n_threads=n_threads)
 
 
 def _name_tokens(df):
@@ -213,6 +233,18 @@ def generate_candidates(s1_df, pool_df, config=None):
         "numeric_max_df_ratio": 0.05,
         "rare_token_max_df_ratio": 0.05,
         "n_threads": -1,
+        # Which channels to run. Measured unique recall on the real data was
+        # addr_char 12.4%, rare_token 0.29%, numeric 0.24%, name_char 0.20%,
+        # name_word 0.04%, while rare_token was the single slowest channel.
+        # Dropping the cheap-recall channels trades ~0.5% of pairs for ~40% of
+        # blocking time, which is worth it when the loss is in the decision
+        # layer rather than in blocking.
+        # "embedding" is left out by default: it needs sentence-transformers
+        # and hnswlib plus a model download, so it must be opted into.
+        "channels": [c for c in CHANNELS if c != "embedding"],
+        "k_embedding": 25,
+        "min_score_embedding": 0.5,
+        "embedding_encoder": None,
     }
     cfg.update(config or {})
 
@@ -223,6 +255,7 @@ def generate_candidates(s1_df, pool_df, config=None):
     pool_missing_country = np.flatnonzero(pool_country == "__MISSING__")
 
     candidates = {sid: defaultdict(dict) for sid in s1_ids}
+    timings = {}
 
     countries = sorted(set(s1_country))
     for country_number, country in enumerate(countries, start=1):
@@ -268,12 +301,26 @@ def generate_candidates(s1_df, pool_df, config=None):
                 _name_tokens(s1_block), _name_tokens(pool_block),
                 cfg["k_rare_token"], cfg["rare_token_max_df_ratio"], min_shared=1,
             ),
+            "embedding": lambda: _embedding_channel(
+                s1_block, pool_block, cfg["embedding_encoder"], cfg["k_embedding"],
+                cfg["min_score_embedding"], cfg["n_threads"],
+            ),
         }
+        enabled = set(cfg["channels"])
+        unknown = enabled - set(CHANNELS)
+        if unknown:
+            raise ValueError(
+                f"unknown blocking channels: {sorted(unknown)}; expected {list(CHANNELS)}"
+            )
+
         channel_hits = {}
         for channel, build_channel in channel_specs.items():
+            if channel not in enabled:
+                continue
             channel_started = time.time()
             channel_hits[channel] = build_channel()
             hit_count = sum(len(matches) for matches in channel_hits[channel].values())
+            timings[channel] = timings.get(channel, 0.0) + (time.time() - channel_started)
             logger.info(
                 "blocking country %d/%d=%s channel=%s done in %.1fs | hits=%d",
                 country_number, len(countries), country, channel,
@@ -292,6 +339,12 @@ def generate_candidates(s1_df, pool_df, config=None):
             sum(len(matches) for matches in candidates.values()),
         )
 
+    if timings:
+        logger.info(
+            "blocking seconds by channel: %s",
+            ", ".join(f"{c}={t:.1f}" for c, t in sorted(timings.items(), key=lambda kv: -kv[1])),
+        )
+    generate_candidates.last_timings = dict(timings)
     return {sid: dict(matches) for sid, matches in candidates.items()}
 
 
@@ -320,6 +373,27 @@ def channel_contribution(candidates, ground_truth):
     return report
 
 
+def _config_cache_view(config):
+    """
+    A JSON-serialisable, run-stable view of the blocking config.
+
+    The config can hold live objects - the embedding encoder - which are not
+    serialisable, and whose repr carries a memory address that would differ on
+    every run and defeat the cache entirely. Objects are therefore reduced to a
+    stable identifier: what the candidates depend on is which model produced
+    the vectors, not which Python object held it.
+    """
+    view = {}
+    for key, value in (config or {}).items():
+        if value is None or isinstance(value, (str, int, float, bool)):
+            view[key] = value
+        elif isinstance(value, (list, tuple)):
+            view[key] = [v if isinstance(v, (str, int, float, bool)) else str(v) for v in value]
+        else:
+            view[key] = getattr(value, "model_name", None) or type(value).__name__
+    return view
+
+
 def _fingerprint(s1_df, pool_df, config):
     """Stable id for a (data, config) combination, used as the cache key."""
     hasher = hashlib.sha256()
@@ -327,7 +401,7 @@ def _fingerprint(s1_df, pool_df, config):
         ids = df["entity_id"].astype(str).to_numpy()
         hasher.update(str(len(ids)).encode())
         hasher.update(hashlib.sha256("\x00".join(ids).encode()).digest())
-    hasher.update(json.dumps(config or {}, sort_keys=True).encode())
+    hasher.update(json.dumps(_config_cache_view(config), sort_keys=True).encode())
     return hasher.hexdigest()[:16]
 
 

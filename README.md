@@ -103,12 +103,130 @@ same record, where at most one can be right. `check_one_to_one()` verifies the
 assumption against the training ground truth first, and the stage disables
 itself automatically if it does not hold.
 
-**D. Set selection** (`decide.py`) — rather than one global threshold,
+**D. Set selection** (`decide.py`) — the measured loss is here. On the real
+5% slice, 3,865 true matches reached the model and were rejected against only
+1,412 that blocking never retrieved, at 98.3% precision and 93.1% recall: far
+too conservative for a metric that trades precision for recall at 2.67:1.
+
+The break-even acceptance probability for an entity holding `m` correct
+predictions out of `n` true matches is
+
+```
+q* = m / (m + 0.25n)
+```
+
+which at n=4 runs 0.00, 0.50, 0.67, 0.75, 0.80 for m = 0..4. A single threshold
+cannot express that: tuned for m=3 it discards the first accept, where the bar
+should be far lower. `tiered` (the default) splits the first accept from the
+rest, capturing most of that shape with one extra parameter and depending only
+on the ordering of the scores rather than their calibration.
+
+`expected_f05` (below) — rather than one global threshold,
 `expected_f05` estimates the expected F0.5 of each top-k prefix by Monte Carlo
 over the calibrated probabilities and returns the best `k`. Predicting a
 singleton (`k=0`) falls out of the same computation, so no separate abstain rule
 is needed. `threshold` (top-1 plus a margin, tuned directly against macro F0.5)
 and `top1` are kept as controls.
+
+## Tuning the decision layer
+
+`tune_tiered` and `tune_threshold` grid-search **directly against macro F0.5**,
+vectorised so a three-dimensional grid costs milliseconds per point. That
+matters twice over: the ranges can be wide enough for the optimum to be
+interior, and the tuner reports `on_grid_edge` when it is not.
+
+That flag is deliberately narrow. A parameter is flagged only when *every*
+setting achieving the best score puts it on an edge — a parameter that sits at
+an edge merely because it has no effect (when `ratio` binds harder than
+`t_rest`, every value scores the same) is not flagged, since widening that
+range would change nothing. `n_optimal_settings` shows how flat the optimum is.
+
+The first tuning run on real data picked `ratio = 0.4` from a grid that started
+at 0.4 — the range, not the data, chose it. Both grids now start at 0.05.
+
+`--cache-dir` caches the featurise-and-score stage as well as blocking, so a
+full sweep is effectively free rather than a 14-minute loop.
+
+Every run reports **calibration** (Brier score plus a reliability table).
+`expected_f05` treats a score as a real probability when it weighs adding a
+candidate, so a large gap between `mean_predicted` and `observed_rate` is the
+signal that it is abstaining for the wrong reason.
+
+## Channel pruning
+
+Measured unique recall on the real data — the share of true pairs *only* that
+channel retrieved:
+
+| Channel | Recall | Unique | Cost (US block) |
+| --- | --- | --- | --- |
+| `addr_char` | 0.898 | **0.1243** | 189s |
+| `rare_token` | 0.733 | 0.0029 | 266s |
+| `numeric` | 0.325 | 0.0024 | 29–95s |
+| `name_char` | 0.720 | 0.0020 | 57s |
+| `name_word` | 0.707 | 0.0004 | 5s |
+
+`addr_char` carries the stage almost single-handedly, and `rare_token` is the
+slowest channel for the second-smallest unique contribution. Since the loss is
+in the decision layer rather than in blocking, trading ~0.5% of pairs for ~40%
+of blocking time is usually worth it:
+
+```bash
+python3 scripts/run_matching.py --train-dir dataset/train \
+    --channels name_char,addr_char,name_word --cache-dir .cache
+```
+
+## Embeddings (opt-in)
+
+A sixth blocking channel plus an `embed_cosine` pairwise feature, aimed at the
+transliteration and wording variation the character n-grams miss — which is
+where the India/US gap sits (0.9425 vs 0.9740) and the only lever available for
+the unseen test country.
+
+```bash
+pip install sentence-transformers hnswlib
+python3 scripts/run_matching.py --train-dir dataset/train --embeddings --cache-dir .cache
+```
+
+### Checking the embedding path quickly
+
+Encoding a full pool is the slow part, so verify the path works on a slice that
+finishes in minutes before committing to a long run:
+
+```bash
+./scripts/smoke_embeddings.sh --train-dir dataset_5pct/train --entities 400
+```
+
+It carves a tiny *label-consistent* slice (shrinking the pool too, since that is
+what drives encoding cost), runs the pipeline with `--embeddings`, and asserts
+the embedding channel actually ran and retrieved true pairs. It answers "does
+this work", not "is it any good" - the slice is far too small for its score to
+mean anything.
+
+`--embedding-model hashing` swaps in a deterministic character-n-gram encoder
+that needs no download. It captures no semantics, so it is only for exercising
+the plumbing offline or in CI.
+
+### Making it fast enough to use
+
+Two things dominate, and both are handled:
+
+- **Encoding is cached.** Vectors are stored under `--cache-dir`, keyed by the
+  model name and the exact serialised text. Without this every run re-encodes
+  the whole pool, which is what makes embeddings feel unusable on a laptop.
+  Preprocessing changes invalidate the cache automatically.
+- **The device is auto-detected.** On Apple Silicon this picks the MPS backend,
+  which is several times faster than CPU for encoding. Override with
+  `--embedding-device`.
+
+Off by default: it needs both packages and a model download. `--embedding-model`
+picks the model — verify its licence on the model card, since the challenge
+requires MIT/Apache-2.0 and at most 8B parameters. Prefer a multilingual model.
+
+Search is approximate (hnswlib); exact search over ~100k x 900k records is not
+tractable. The index defaults to `M=32, ef=8k`, measured at 0.999 recall against
+exact search on structureless vectors, where `ef=2k` gave only 0.82. The
+`embed_cosine` feature is exact regardless, computed in a chunked vectorised
+pass because gathering every pair's vectors at once would need tens of GB.
 
 ## Usage
 
@@ -237,6 +355,58 @@ Blocking dominates the runtime; everything downstream is comparatively cheap.
 ```bash
 python3 scripts/run_matching.py --train-dir dataset/train --cache-dir .cache
 ```
+
+## Building the submission package
+
+```bash
+python3 scripts/build_submission.py \
+    --team-name your_team \
+    --output-dir output --test-dir dataset/test \
+    --report-file reports/matching_full.json
+```
+
+Produces `dist/your_team_submission.zip` in the required layout:
+
+```
+<team_name>_submission.zip
+|-- output/{matching_results,candidate_pairs}.tsv
+|-- code/business_entity_resolution/{src,scripts,utils}/ + README.md + requirements.txt
+`-- Documentation_template.md
+```
+
+Two challenge rules drive it. Submissions that fail validation are not
+evaluated, so the outputs go through `utils/validate_submission.py` first and
+the archive is **refused** if they do not pass (override with
+`--skip-validation`, which you should not need). And dependencies must be
+pinned, so `requirements.txt` is written from the versions actually installed
+in the environment that produced the outputs, not from this repo's ranges.
+
+Without `--test-dir` validation is reported as SKIPPED rather than as a pass -
+the central rule is that every test Source 1 entity appears exactly once, which
+cannot be checked without the test set.
+
+Pass the challenge's own template with `--documentation` to use it as the base.
+Either way the methodology document gains an auto-generated appendix carrying
+the measured numbers - baseline, blocking recall, channel contribution, the
+ablation, error attribution, calibration - so the prose you write cites real
+results. **The prose itself is yours to write; the scaffold is not a
+submission.**
+
+## Running on a bigger machine
+
+Training does not need the full data - the fit slice is already ample - but
+inference over the complete test set is fixed by the challenge and is the run
+that needs headroom. Blocking cost grows with the *product* of the two sides,
+so a 5% slice does roughly 0.25% of the full work; measure before sizing with
+`scripts/scale_probe.py`.
+
+Memory binds before time. At the 5% slice the candidate set and feature matrix
+are about 1 GB each; at full scale that is ~20 GB each, so prefer a
+memory-optimised instance over a merely fast one. GPU only helps the embedding
+encoder, not the rest of the pipeline.
+
+Carry `--cache-dir` onto the remote machine if you can: blocking, scores and
+embedding vectors all live there, and re-running without it repeats everything.
 
 ## Testing without the dataset
 
