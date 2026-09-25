@@ -1,0 +1,269 @@
+"""
+Stage A: candidate generation.
+
+Recall lost here is unrecoverable, so the strategy is a *union* of several
+independent channels rather than a single similarity. Each channel is good at a
+different noise pattern, and a pair only has to survive one of them:
+
+    name_char     char 3-5 gram TF-IDF on the name   -> typos, suffix variants
+    addr_char     char 3-5 gram TF-IDF on the address -> abbreviations, spacing
+    name_word     word-level TF-IDF on the name       -> word-order transposition
+    numeric       shared house / postal numbers       -> renamed businesses
+    rare_token    shared high-IDF name tokens         -> distinctive long-tail names
+
+Everything is blocked by country first, which is a near-free 100x reduction.
+Records with a missing country are pooled into every country block so they are
+never silently dropped.
+"""
+import logging
+import re
+from collections import Counter, defaultdict
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+logger = logging.getLogger(__name__)
+
+CHANNELS = ("name_char", "addr_char", "name_word", "numeric", "rare_token")
+
+
+def _text(df, column):
+    """Column as a list of plain strings, with missing values as ''."""
+    if column not in df.columns:
+        return [""] * len(df)
+    return df[column].fillna("").astype(str).tolist()
+
+
+def _sparse_topk(query, pool, k, max_dense_cells=4_000_000):
+    """
+    Top-k pool rows for each query row by cosine similarity.
+
+    TF-IDF rows are L2-normalised, so the dot product is the cosine. The product
+    is materialised in row chunks sized to a memory budget, since the full
+    query x pool matrix is far too large to hold at once.
+
+    Yields (query_index, pool_index, score).
+    """
+    n_pool = pool.shape[0]
+    if n_pool == 0 or query.shape[0] == 0:
+        return
+
+    chunk = max(1, min(query.shape[0], int(max_dense_cells // max(n_pool, 1))))
+    k = min(k, n_pool)
+
+    for start in range(0, query.shape[0], chunk):
+        block = (query[start:start + chunk] @ pool.T).toarray()
+        # argpartition gives the k largest per row without a full sort
+        part = np.argpartition(-block, k - 1, axis=1)[:, :k]
+        for row in range(block.shape[0]):
+            cols = part[row]
+            scores = block[row, cols]
+            keep = scores > 0
+            for col, score in zip(cols[keep], scores[keep]):
+                yield start + row, int(col), float(score)
+
+
+def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score):
+    """One TF-IDF channel: fit on both sides together, then top-k per S1 row."""
+    s1_text, pool_text = _text(s1_df, column), _text(pool_df, column)
+    if not any(s1_text) or not any(pool_text):
+        return {}
+
+    vectorizer = TfidfVectorizer(
+        analyzer=analyzer,
+        ngram_range=ngram_range,
+        min_df=1,
+        sublinear_tf=True,
+        dtype=np.float32,
+    )
+    try:
+        vectorizer.fit(s1_text + pool_text)
+        s1_matrix = vectorizer.transform(s1_text)
+        pool_matrix = vectorizer.transform(pool_text)
+    except ValueError:
+        # empty vocabulary (e.g. every value missing in a tiny country block)
+        return {}
+
+    hits = defaultdict(dict)
+    for qi, pi, score in _sparse_topk(s1_matrix, pool_matrix, k):
+        if score >= min_score:
+            hits[qi][pi] = score
+    return hits
+
+
+def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
+                            min_df_cap=100):
+    """
+    Shared-token channel. Tokens present in more than `max_df_ratio` of the pool
+    carry no signal and would create huge posting lists, so they are skipped.
+
+    The cap has an absolute floor: a pure ratio filters out every token on a
+    small corpus (a 2% cap over 1k records skips anything seen more than 20
+    times, which is most name tokens) while behaving sensibly at 100k records.
+    Remaining tokens are still IDF-weighted, so common ones contribute little.
+    """
+    n_pool = len(pool_tokens)
+    if n_pool == 0:
+        return {}
+
+    postings = defaultdict(list)
+    for idx, tokens in enumerate(pool_tokens):
+        for token in set(tokens):
+            postings[token].append(idx)
+
+    df_cap = max(1, int(max_df_ratio * n_pool), min(min_df_cap, n_pool))
+    idf = {
+        token: np.log(n_pool / len(ids))
+        for token, ids in postings.items()
+        if len(ids) <= df_cap
+    }
+
+    hits = {}
+    for qi, tokens in enumerate(s1_tokens):
+        weights = Counter()
+        counts = Counter()
+        for token in set(tokens):
+            if token not in idf:
+                continue
+            weight = idf[token]
+            for pi in postings[token]:
+                weights[pi] += weight
+                counts[pi] += 1
+        if not weights:
+            continue
+        scored = [(pi, w) for pi, w in weights.items() if counts[pi] >= min_shared]
+        scored.sort(key=lambda item: -item[1])
+        top = scored[:k]
+        if top:
+            # normalise so the score is comparable across entities
+            best = top[0][1]
+            hits[qi] = {pi: float(w / best) for pi, w in top}
+    return hits
+
+
+def _name_tokens(df):
+    column = "business_name_core" if "business_name_core" in df.columns else "business_name_clean"
+    return [t.split() for t in _text(df, column)]
+
+
+def _numeric_tokens(df):
+    if "address_numbers" in df.columns:
+        return [t.split() for t in _text(df, "address_numbers")]
+    return [re.findall(r"\b\d+\b", t) for t in _text(df, "business_address_clean")]
+
+
+def _country_key(df):
+    if "country_clean" not in df.columns:
+        return np.array(["__ALL__"] * len(df), dtype=object)
+    return df["country_clean"].fillna("__MISSING__").astype(str).to_numpy(dtype=object)
+
+
+def generate_candidates(s1_df, pool_df, config=None):
+    """
+    Build the candidate set for every Source 1 entity.
+
+    Args:
+        s1_df: preprocessed Source 1 records.
+        pool_df: preprocessed Source 2 + Source 3 records, concatenated.
+        config: optional overrides for the per-channel top-k and thresholds.
+
+    Returns:
+        dict s1_entity_id -> {candidate_entity_id: {channel: score, ...}}
+    """
+    cfg = {
+        "k_name_char": 25,
+        "k_addr_char": 25,
+        "k_name_word": 25,
+        "k_numeric": 25,
+        "k_rare_token": 25,
+        "min_score_char": 0.15,
+        "min_score_word": 0.15,
+        "numeric_max_df_ratio": 0.05,
+        "rare_token_max_df_ratio": 0.05,
+    }
+    cfg.update(config or {})
+
+    s1_ids = s1_df["entity_id"].to_numpy(dtype=object)
+    pool_ids = pool_df["entity_id"].to_numpy(dtype=object)
+
+    s1_country, pool_country = _country_key(s1_df), _country_key(pool_df)
+    pool_missing_country = np.flatnonzero(pool_country == "__MISSING__")
+
+    candidates = {sid: defaultdict(dict) for sid in s1_ids}
+
+    for country in sorted(set(s1_country)):
+        s1_rows = np.flatnonzero(s1_country == country)
+        if country == "__MISSING__":
+            # unknown country could belong anywhere -> compare against everything
+            pool_rows = np.arange(len(pool_df))
+        else:
+            pool_rows = np.union1d(
+                np.flatnonzero(pool_country == country), pool_missing_country
+            )
+        if len(pool_rows) == 0:
+            continue
+
+        s1_block = s1_df.iloc[s1_rows]
+        pool_block = pool_df.iloc[pool_rows]
+        logger.info(
+            "blocking country=%s | s1=%d pool=%d", country, len(s1_block), len(pool_block)
+        )
+
+        name_column = (
+            "business_name_core" if "business_name_core" in s1_df.columns else "business_name_clean"
+        )
+        channel_hits = {
+            "name_char": _tfidf_channel(
+                s1_block, pool_block, name_column, cfg["k_name_char"],
+                "char_wb", (3, 5), cfg["min_score_char"],
+            ),
+            "addr_char": _tfidf_channel(
+                s1_block, pool_block, "business_address_clean", cfg["k_addr_char"],
+                "char_wb", (3, 5), cfg["min_score_char"],
+            ),
+            "name_word": _tfidf_channel(
+                s1_block, pool_block, name_column, cfg["k_name_word"],
+                "word", (1, 1), cfg["min_score_word"],
+            ),
+            "numeric": _inverted_index_channel(
+                _numeric_tokens(s1_block), _numeric_tokens(pool_block),
+                cfg["k_numeric"], cfg["numeric_max_df_ratio"], min_shared=1,
+            ),
+            "rare_token": _inverted_index_channel(
+                _name_tokens(s1_block), _name_tokens(pool_block),
+                cfg["k_rare_token"], cfg["rare_token_max_df_ratio"], min_shared=1,
+            ),
+        }
+
+        for channel, hits in channel_hits.items():
+            for local_qi, matches in hits.items():
+                s1_id = s1_ids[s1_rows[local_qi]]
+                for local_pi, score in matches.items():
+                    candidates[s1_id][pool_ids[pool_rows[local_pi]]][channel] = score
+
+    return {sid: dict(matches) for sid, matches in candidates.items()}
+
+
+def channel_contribution(candidates, ground_truth):
+    """
+    Per-channel recall, so a channel that earns nothing can be dropped and a
+    channel doing unique work is kept. `unique_recall` counts true pairs that
+    *only* this channel retrieved.
+    """
+    report = {}
+    for channel in CHANNELS:
+        found = unique = total = 0
+        for s1_id, truth in ground_truth.items():
+            matches = candidates.get(s1_id, {})
+            for t in truth:
+                total += 1
+                channels_hit = matches.get(t)
+                if channels_hit and channel in channels_hit:
+                    found += 1
+                    if len(channels_hit) == 1:
+                        unique += 1
+        report[channel] = {
+            "recall": found / total if total else 0.0,
+            "unique_recall": unique / total if total else 0.0,
+        }
+    return report
