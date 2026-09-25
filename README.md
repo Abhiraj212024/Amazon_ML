@@ -185,6 +185,11 @@ It exits 0 only when everything below passes, so it can gate a launch script:
 Flags: `--quick` (skip the synthetic end-to-end), `--keep` (retain artifacts for
 inspection), `PYTHON=...` to pick an interpreter.
 
+Execute it, do not `source` it. Sourcing runs it in your current shell, so the
+bash shebang is ignored — under zsh that previously resolved the repo root to
+`/` and ran everything from there. The script now refuses to be sourced, and
+re-execs itself under bash if invoked from another shell.
+
 ## Check your data before trusting a score
 
 The fastest way to get a meaningless result is to subsample the three source
