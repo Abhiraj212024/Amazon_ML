@@ -10,6 +10,8 @@ dataset/
 *.tsv
 *.csv
 *.parquet
+*.zip
+*.parquet
 
 # Reports
 reports/*.json
