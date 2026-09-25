@@ -152,6 +152,39 @@ importance, error attribution by stage (`lost_in_blocking` / `lost_in_decision`
 / `false_merge` / `singleton_broken`), and macro F0.5 sliced by country and by
 true-match count.
 
+## Pre-flight check before Kaggle / AWS
+
+One command that proves the pipeline is correct and the data is consistent,
+before a full run costs money or a session quota.
+
+```bash
+./scripts/preflight.sh                             # code checks only
+./scripts/preflight.sh --data-dir dataset/train    # also check your real data
+./scripts/preflight.sh --data-dir dataset/train --scale-probe
+```
+
+It exits 0 only when everything below passes, so it can gate a launch script:
+
+1. Python version, required and optional packages, core count and memory
+   (useful for sizing an instance).
+2. Unit tests for both preprocessing and matching.
+3. A full synthetic end-to-end run: generate data, block, train, predict, write
+   both submission files.
+4. **Self-test of the consistency checker** on known-good data — if it cannot
+   pass that, its verdict on your real data is worthless.
+5. **Cache correctness** — a second run must reuse the cache *and* reproduce the
+   first run's output byte for byte.
+6. The official `utils/validate_submission.py`, with `--check-ids`.
+7. With `--data-dir`: the recall ceiling on your real data, and the all-empty
+   baseline you have to beat.
+8. With `--scale-probe`: times blocking at several sampling fractions, fits the
+   growth curve and projects the full-data cost. Blocking grows with the
+   *product* of the two sides, so a 5% sample does roughly 0.25% of the full
+   work — extrapolating linearly underestimates it badly.
+
+Flags: `--quick` (skip the synthetic end-to-end), `--keep` (retain artifacts for
+inspection), `PYTHON=...` to pick an interpreter.
+
 ## Check your data before trusting a score
 
 The fastest way to get a meaningless result is to subsample the three source
