@@ -152,6 +152,87 @@ importance, error attribution by stage (`lost_in_blocking` / `lost_in_decision`
 / `false_merge` / `singleton_broken`), and macro F0.5 sliced by country and by
 true-match count.
 
+## Pre-flight check before Kaggle / AWS
+
+One command that proves the pipeline is correct and the data is consistent,
+before a full run costs money or a session quota.
+
+```bash
+./scripts/preflight.sh                             # code checks only
+./scripts/preflight.sh --data-dir dataset/train    # also check your real data
+./scripts/preflight.sh --data-dir dataset/train --scale-probe
+```
+
+It exits 0 only when everything below passes, so it can gate a launch script:
+
+1. Python version, required and optional packages, core count and memory
+   (useful for sizing an instance).
+2. Unit tests for both preprocessing and matching.
+3. A full synthetic end-to-end run: generate data, block, train, predict, write
+   both submission files.
+4. **Self-test of the consistency checker** on known-good data — if it cannot
+   pass that, its verdict on your real data is worthless.
+5. **Cache correctness** — a second run must reuse the cache *and* reproduce the
+   first run's output byte for byte.
+6. The official `utils/validate_submission.py`, with `--check-ids`.
+7. With `--data-dir`: the recall ceiling on your real data, and the all-empty
+   baseline you have to beat.
+8. With `--scale-probe`: times blocking at several sampling fractions, fits the
+   growth curve and projects the full-data cost. Blocking grows with the
+   *product* of the two sides, so a 5% sample does roughly 0.25% of the full
+   work — extrapolating linearly underestimates it badly.
+
+Flags: `--quick` (skip the synthetic end-to-end), `--keep` (retain artifacts for
+inspection), `PYTHON=...` to pick an interpreter.
+
+## Check your data before trusting a score
+
+The fastest way to get a meaningless result is to subsample the three source
+files independently of the ground truth. The labels still name Source 2/3
+records that are no longer in the pool, so no blocking strategy can retrieve
+them and pair recall collapses to roughly the sampling rate.
+
+```bash
+python3 scripts/diagnose_data.py --train-dir dataset/train
+```
+
+Look at `recall_ceiling` — the best pair recall achievable on those files. If it
+is far below 1.0, the data is inconsistent, not the model. `unwinnable_rate` is
+the share of entities that cannot score above 0 whatever you predict.
+
+To work on a smaller slice, sample Source 1 *entities* and carry their full
+match sets:
+
+```bash
+python3 scripts/make_subsample.py \
+    --train-dir dataset/train --output-dir dataset_5pct/train --fraction 0.05
+python3 scripts/diagnose_data.py --train-dir dataset_5pct/train   # expect 100%
+```
+
+`--distractor-multiplier` controls how many unrelated pool records come along.
+The default keeps the full data's pool-to-entity ratio; a thinned pool makes
+matching artificially easy and inflates precision.
+
+## Performance
+
+Blocking dominates the runtime; everything downstream is comparatively cheap.
+
+- **`sparse_dot_topn`** (in `requirements.txt`) computes the top-k of the sparse
+  product without densifying it, multi-threaded. It is roughly 10x faster
+  single-threaded than the fallback and ~20x with 4 cores. `scripts/test_matching.py`
+  asserts both paths return the same top-k scores. If the package is missing the
+  pipeline still runs, just slowly.
+- **`--cache-dir`** stores the candidate set keyed by a fingerprint of the entity
+  ids plus the blocking config, so tuning the model, thresholds or conflict
+  stage costs minutes instead of re-running blocking. The key invalidates
+  itself when either the data or the blocking config changes.
+- **`--blocking-threads`** sets the thread count for the sparse product
+  (default: all cores).
+
+```bash
+python3 scripts/run_matching.py --train-dir dataset/train --cache-dir .cache
+```
+
 ## Testing without the dataset
 
 ```bash
