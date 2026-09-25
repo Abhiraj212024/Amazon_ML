@@ -17,6 +17,7 @@ never silently dropped.
 """
 import logging
 import re
+import time
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -191,7 +192,8 @@ def generate_candidates(s1_df, pool_df, config=None):
 
     candidates = {sid: defaultdict(dict) for sid in s1_ids}
 
-    for country in sorted(set(s1_country)):
+    countries = sorted(set(s1_country))
+    for country_number, country in enumerate(countries, start=1):
         s1_rows = np.flatnonzero(s1_country == country)
         if country == "__MISSING__":
             # unknown country could belong anywhere -> compare against everything
@@ -206,40 +208,57 @@ def generate_candidates(s1_df, pool_df, config=None):
         s1_block = s1_df.iloc[s1_rows]
         pool_block = pool_df.iloc[pool_rows]
         logger.info(
-            "blocking country=%s | s1=%d pool=%d", country, len(s1_block), len(pool_block)
+            "blocking country %d/%d=%s | s1=%d pool=%d",
+            country_number, len(countries), country, len(s1_block), len(pool_block),
         )
 
         name_column = (
             "business_name_core" if "business_name_core" in s1_df.columns else "business_name_clean"
         )
-        channel_hits = {
-            "name_char": _tfidf_channel(
+        channel_specs = {
+            "name_char": lambda: _tfidf_channel(
                 s1_block, pool_block, name_column, cfg["k_name_char"],
                 "char_wb", (3, 5), cfg["min_score_char"],
             ),
-            "addr_char": _tfidf_channel(
+            "addr_char": lambda: _tfidf_channel(
                 s1_block, pool_block, "business_address_clean", cfg["k_addr_char"],
                 "char_wb", (3, 5), cfg["min_score_char"],
             ),
-            "name_word": _tfidf_channel(
+            "name_word": lambda: _tfidf_channel(
                 s1_block, pool_block, name_column, cfg["k_name_word"],
                 "word", (1, 1), cfg["min_score_word"],
             ),
-            "numeric": _inverted_index_channel(
+            "numeric": lambda: _inverted_index_channel(
                 _numeric_tokens(s1_block), _numeric_tokens(pool_block),
                 cfg["k_numeric"], cfg["numeric_max_df_ratio"], min_shared=1,
             ),
-            "rare_token": _inverted_index_channel(
+            "rare_token": lambda: _inverted_index_channel(
                 _name_tokens(s1_block), _name_tokens(pool_block),
                 cfg["k_rare_token"], cfg["rare_token_max_df_ratio"], min_shared=1,
             ),
         }
+        channel_hits = {}
+        for channel, build_channel in channel_specs.items():
+            channel_started = time.time()
+            channel_hits[channel] = build_channel()
+            hit_count = sum(len(matches) for matches in channel_hits[channel].values())
+            logger.info(
+                "blocking country %d/%d=%s channel=%s done in %.1fs | hits=%d",
+                country_number, len(countries), country, channel,
+                time.time() - channel_started, hit_count,
+            )
 
         for channel, hits in channel_hits.items():
             for local_qi, matches in hits.items():
                 s1_id = s1_ids[s1_rows[local_qi]]
                 for local_pi, score in matches.items():
                     candidates[s1_id][pool_ids[pool_rows[local_pi]]][channel] = score
+
+        logger.info(
+            "blocking country %d/%d=%s complete | candidates=%d",
+            country_number, len(countries), country,
+            sum(len(matches) for matches in candidates.values()),
+        )
 
     return {sid: dict(matches) for sid, matches in candidates.items()}
 
