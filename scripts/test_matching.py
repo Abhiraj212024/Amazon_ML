@@ -42,6 +42,14 @@ from src.matching.decide import expected_f05_select, select_matches, threshold_s
 from src.matching.pair_features import build_idf, build_pair_table, build_record_views
 from src.preprocessing.pipeline import preprocess_dataframe
 
+try:
+    import pytest
+    @pytest.fixture
+    def tmp_dir(tmp_path):
+        return str(tmp_path)
+except ImportError:
+    pass
+
 
 def test_f05_closed_form():
     # the worked example from the problem statement

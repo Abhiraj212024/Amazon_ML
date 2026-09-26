@@ -119,6 +119,13 @@ def main():
     parser.add_argument("--only-shards", default=None,
                         help="comma-separated shard indices, for splitting across sessions")
     parser.add_argument("--blocking-threads", type=int, default=-1)
+    parser.add_argument("--channels", default=None,
+                        help="override blocking channels (default: addr_char,name_char,name_word)")
+    parser.add_argument("--max-df-char", type=float, default=0.1,
+                        help="drop char n-grams appearing in > this share of pool (default: 0.1)")
+    parser.add_argument("--embeddings", action="store_true",
+                        help="enable dense embedding reranking for embed_cosine feature")
+    parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-device", default=None)
     parser.add_argument("--report-file", default=None)
     args = parser.parse_args()
@@ -130,30 +137,38 @@ def main():
     matcher = bundle["matcher"]
     blocking_config = dict(bundle["blocking_config"])
     blocking_config["n_threads"] = args.blocking_threads
-    channels = blocking_config.get("channels", [])
-    logger.info("channels: %s | strategy: %s | conflict: %s",
-                ", ".join(channels), bundle["strategy"], bundle["conflict_stage"])
 
+    if args.channels:
+        channels = [c.strip() for c in args.channels.split(",") if c.strip()]
+        blocking_config["channels"] = channels
+    else:
+        # Approach A default: fast 3 lexical channels
+        channels = [c for c in blocking_config.get("channels", ["addr_char", "name_char", "name_word"])
+                    if c in ("addr_char", "name_char", "name_word")]
+        if not channels:
+            channels = ["addr_char", "name_char", "name_word"]
+        blocking_config["channels"] = channels
+
+    if args.max_df_char is not None:
+        blocking_config["max_df_char"] = args.max_df_char
+
+    logger.info("channels: %s (max_df=%.2f) | strategy: %s | conflict: %s",
+                ", ".join(channels), blocking_config.get("max_df_char", 1.0),
+                bundle["strategy"], bundle["conflict_stage"])
+
+    use_embeddings = args.embeddings or bool(bundle["extra"].get("embedding_model"))
     encoder = None
-    if "embedding" in channels:
-        from src.matching.embeddings import build_encoder
+    if use_embeddings:
+        from src.matching.embeddings import DEFAULT_MODEL, build_encoder
 
-        model_name = bundle["extra"].get("embedding_model")
+        model_name = args.embedding_model or bundle["extra"].get("embedding_model") or DEFAULT_MODEL
+        logger.info("loading embedding reranker model %s", model_name)
         encoder = build_encoder(model_name, device=args.embedding_device)
-        blocking_config["embedding_encoder"] = encoder
+
+    blocking_config["embedding_encoder"] = encoder if "embedding" in channels else None
 
     s1_df, pool_df = _load_sources(args.test_dir, args.prefix)
     entity_ids = s1_df["entity_id"].astype(str).tolist()
-
-    pool_embedding = None
-    if encoder is not None:
-        from src.matching.embeddings import build_embedding_lookup
-
-        pool_map, pool_vectors = build_embedding_lookup(
-            pool_df, encoder, args.shard_dir or os.path.join(args.output_dir, "shards"),
-            "predict_pool",
-        )
-        pool_embedding = (pool_map, pool_vectors)
 
     # built once and reused by every shard: without it the pool's vectorisers
     # and inverted indexes are rebuilt per shard, which measured 2.6x the
@@ -195,11 +210,17 @@ def main():
         pool_views = build_record_views(pool_df, only=needed)
         shard_views = build_record_views(shard_df)
         embedding = None
-        if encoder is not None:
+        if encoder is not None and len(needed):
             from src.matching.embeddings import build_embedding_lookup, pair_cosines
 
+            needed_df = pool_df[pool_df["entity_id"].isin(needed)].reset_index(drop=True)
             shard_map, shard_vectors = build_embedding_lookup(shard_df, encoder)
-            embedding = (shard_map, shard_vectors, pool_embedding[0], pool_embedding[1])
+            pool_map, pool_vectors = build_embedding_lookup(
+                needed_df, encoder,
+                cache_dir=args.shard_dir or os.path.join(args.output_dir, "shards"),
+                tag=f"pool_cand_{index}",
+            )
+            embedding = (shard_map, shard_vectors, pool_map, pool_vectors)
 
         X, pair_index = build_pair_table(
             candidates, shard_views, pool_views, bundle["name_idf"], bundle["addr_idf"]
@@ -245,6 +266,8 @@ def main():
             len(X), time.time() - shard_started,
         )
         del pool_views, shard_views, X, pair_index, candidates
+        if embedding is not None:
+            del embedding, pool_map, pool_vectors, shard_map, shard_vectors
 
     if wanted is not None:
         logger.info("finished the requested shards; re-run without --only-shards to merge")

@@ -12,6 +12,7 @@ dataset/
 *.parquet
 *.zip
 *.parquet
+*.pkl
 
 # Reports
 reports/*.json

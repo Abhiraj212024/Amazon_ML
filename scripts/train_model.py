@@ -116,7 +116,8 @@ def main():
                         help="top-k each blocking channel keeps (0 = default 25). Lowering this shrinks the union while each channel keeps its OWN best hits, which post-union pruning cannot guarantee.")
     parser.add_argument("--max-candidates", type=int, default=0,
                         help="cap candidates per entity after the union (0 = no cap)")
-    parser.add_argument("--max-df-char", type=float, default=1.0)
+    parser.add_argument("--max-df-char", type=float, default=0.1,
+                        help="drop char n-grams appearing in > this share of pool (default: 0.1)")
     parser.add_argument("--blocking-threads", type=int, default=-1)
     parser.add_argument("--embeddings", action="store_true")
     parser.add_argument("--embedding-model", default=None)
@@ -169,19 +170,19 @@ def main():
     logger.info("fit=%d tune=%d val=%d", len(fit_ids), len(tune_ids), len(val_ids))
     report["split"] = {"fit": len(fit_ids), "tune": len(tune_ids), "val": len(val_ids)}
 
+    from src.matching.blocking import FAST_CHANNELS
+
     channels = ([c.strip() for c in args.channels.split(",") if c.strip()]
-                if args.channels else [c for c in CHANNELS if c != "embedding"])
+                if args.channels else list(FAST_CHANNELS))
     encoder = None
     if args.embeddings:
         from src.matching.embeddings import DEFAULT_MODEL, build_encoder
 
-        if "embedding" not in channels:
-            channels.append("embedding")
         encoder = build_encoder(args.embedding_model or DEFAULT_MODEL,
                                 device=args.embedding_device)
 
     blocking_config = {"n_threads": args.blocking_threads, "channels": channels,
-                       "embedding_encoder": encoder,
+                       "embedding_encoder": encoder if "embedding" in channels else None,
                        "max_candidates": args.max_candidates,
                        "max_df_char": args.max_df_char}
     if args.k_per_channel:
@@ -220,8 +221,12 @@ def main():
     if encoder is not None:
         from src.matching.embeddings import build_embedding_lookup
 
+        candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
+        candidate_pool_df = pool_df[pool_df["entity_id"].isin(candidate_pool_ids)].reset_index(drop=True)
+        logger.info("encoding %d S1 entities and %d surviving candidate pool records",
+                    len(used_df), len(candidate_pool_df))
         s1_map, s1_vec = build_embedding_lookup(used_df, encoder, args.cache_dir, "train_s1")
-        pool_map, pool_vec = build_embedding_lookup(pool_df, encoder, args.cache_dir, "train_pool")
+        pool_map, pool_vec = build_embedding_lookup(candidate_pool_df, encoder, args.cache_dir, "train_cand_pool")
         embedding = (s1_map, s1_vec, pool_map, pool_vec)
 
     def featurise(ids):

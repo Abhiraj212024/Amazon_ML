@@ -215,8 +215,8 @@ def main():
                              "are unioned (0 = no cap). Smaller candidate sets are ranked "
                              "higher by the organisers, and featurising plus scoring is "
                              "linear in this number. Sweep it with scripts/tune_blocking.py")
-    parser.add_argument("--max-df-char", type=float, default=1.0,
-                        help="drop char n-grams appearing in more than this share of the pool")
+    parser.add_argument("--max-df-char", type=float, default=0.1,
+                        help="drop char n-grams appearing in more than this share of the pool (default: 0.1)")
     parser.add_argument("--max-k", type=int, default=10,
                         help="most matches predictable for one entity")
     parser.add_argument("--embeddings", action="store_true",
@@ -289,14 +289,12 @@ def main():
     # --- stage A: blocking -------------------------------------------------
     logger.info("generating candidates")
     t0 = time.time()
-    from src.matching.blocking import CHANNELS
+    from src.matching.blocking import FAST_CHANNELS
 
     if args.channels:
         channels = [c.strip() for c in args.channels.split(",") if c.strip()]
     else:
-        channels = [c for c in CHANNELS if c != "embedding"]
-    if args.embeddings and "embedding" not in channels:
-        channels.append("embedding")
+        channels = list(FAST_CHANNELS)
 
     encoder = None
     if args.embeddings:
@@ -313,7 +311,7 @@ def main():
     blocking_config = {
         "n_threads": args.blocking_threads,
         "channels": channels,
-        "embedding_encoder": encoder,
+        "embedding_encoder": encoder if "embedding" in channels else None,
         "max_candidates": args.max_candidates,
         "max_df_char": args.max_df_char,
     }
@@ -359,8 +357,12 @@ def main():
         from src.matching.embeddings import build_embedding_lookup
 
         started = time.time()
+        candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
+        candidate_pool_df = pool_df[pool_df["entity_id"].isin(candidate_pool_ids)].reset_index(drop=True)
+        logger.info("encoding %d S1 entities and %d surviving candidate pool records",
+                    len(s1_df), len(candidate_pool_df))
         s1_map, s1_vectors = build_embedding_lookup(s1_df, encoder, args.cache_dir, "train_s1")
-        pool_map, pool_vectors = build_embedding_lookup(pool_df, encoder, args.cache_dir, "train_pool")
+        pool_map, pool_vectors = build_embedding_lookup(candidate_pool_df, encoder, args.cache_dir, "train_cand_pool")
         embedding = (s1_map, s1_vectors, pool_map, pool_vectors)
         report["embedding"] = {
             "model": getattr(encoder, "model_name", "unknown"),
@@ -490,8 +492,12 @@ def main():
         if encoder is not None:
             from src.matching.embeddings import build_embedding_lookup
 
+            test_cand_ids = {cand_id for matches in test_candidates.values() for cand_id in matches}
+            test_cand_pool_df = test_pool[test_pool["entity_id"].isin(test_cand_ids)].reset_index(drop=True)
+            logger.info("encoding %d test S1 entities and %d surviving test candidate pool records",
+                        len(test_s1), len(test_cand_pool_df))
             t_s1_map, t_s1_vec = build_embedding_lookup(test_s1, encoder, args.cache_dir, "test_s1")
-            t_pool_map, t_pool_vec = build_embedding_lookup(test_pool, encoder, args.cache_dir, "test_pool")
+            t_pool_map, t_pool_vec = build_embedding_lookup(test_cand_pool_df, encoder, args.cache_dir, "test_cand_pool")
             test_embedding = (t_s1_map, t_s1_vec, t_pool_map, t_pool_vec)
 
         test_scored, _, _ = _score_pairs(
