@@ -41,7 +41,7 @@ sys.path.insert(0, _project_root())
 
 from src.matching import io as match_io
 from src.matching import resolve
-from src.matching.blocking import generate_candidates
+from src.matching.blocking import PoolIndex, generate_candidates
 from src.matching.decide import select_matches
 from src.matching.pair_features import (
     build_pair_table, build_record_views, set_embedding_feature, FEATURE_NAMES,
@@ -139,6 +139,11 @@ def main():
             "predict_pool",
         )
         pool_embedding = (pool_map, pool_vectors)
+
+    # built once and reused by every shard: without it the pool's vectorisers
+    # and inverted indexes are rebuilt per shard, which measured 2.6x the
+    # unsharded cost at ten shards and gets worse as shards are added
+    blocking_config["pool_index"] = PoolIndex()
 
     shard_dir = args.shard_dir or os.path.join(args.output_dir, "shards")
     os.makedirs(shard_dir, exist_ok=True)

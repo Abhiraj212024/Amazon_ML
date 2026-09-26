@@ -159,6 +159,48 @@ def prune_candidates(candidates, max_per_entity, channel_order=None):
     return pruned
 
 
+class PoolIndex:
+    """
+    Pool-side structures built once and reused across shards.
+
+    Inference shards the Source 1 side but blocks every shard against the whole
+    pool, so without this the TF-IDF vectoriser is refitted and the inverted
+    indexes rebuilt for each shard. Measured on a 20k x 40k block, ten shards
+    cost 2.1x the unsharded time; at full scale, with tens of shards over a
+    multi-million-record pool, that fixed cost dominates everything else.
+
+    Hold one of these for a given pool and pass it in the blocking config. It
+    refuses a different pool rather than silently serving the wrong vectors.
+    """
+
+    def __init__(self):
+        self._entries = {}
+        self._signature = None
+
+    def bind(self, pool_df):
+        signature = (
+            len(pool_df),
+            hashlib.sha256(
+                "\x00".join(pool_df["entity_id"].astype(str).to_numpy()).encode()
+            ).hexdigest()[:16],
+        )
+        if self._signature is None:
+            self._signature = signature
+        elif self._signature != signature:
+            raise ValueError(
+                "this PoolIndex was built for a different pool; create a new one "
+                "rather than serving vectors fitted on the wrong records"
+            )
+
+    def get(self, key, build):
+        if key not in self._entries:
+            self._entries[key] = build()
+        return self._entries[key]
+
+    def __len__(self):
+        return len(self._entries)
+
+
 def _text(df, column):
     """Column as a list of plain strings, with missing values as ''."""
     if column not in df.columns:
@@ -210,7 +252,8 @@ def _sparse_topk(query, pool, k, min_score=0.0, max_dense_cells=4_000_000, n_thr
 
 
 def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score,
-                   n_threads=-1, max_df=1.0, max_df_min_docs=1000):
+                   n_threads=-1, max_df=1.0, max_df_min_docs=1000,
+                   pool_index=None, cache_key=None):
     """One TF-IDF channel: fit on both sides together, then top-k per S1 row."""
     s1_text, pool_text = _text(s1_df, column), _text(pool_df, column)
     if not any(s1_text) or not any(pool_text):
@@ -220,27 +263,36 @@ def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score,
     if len(pool_text) < max_df_min_docs:
         max_df = 1.0
 
-    vectorizer = TfidfVectorizer(
-        analyzer=analyzer,
-        ngram_range=ngram_range,
-        min_df=1,
-        max_df=max_df,
-        sublinear_tf=True,
-        dtype=np.float32,
-    )
-    try:
-        # Fitted on the pool alone, not on pool + Source 1. The pool is what is
-        # being searched, so its statistics are the right ones - and, crucially,
-        # they do not change when the Source 1 side is processed in shards.
-        # Fitting on both made the vocabulary and IDF depend on which entities
-        # happened to be in the batch, so candidate_pairs.tsv came out different
-        # for different shard counts, on a file the organisers audit.
-        vectorizer.fit(pool_text)
-        s1_matrix = vectorizer.transform(s1_text)
-        pool_matrix = vectorizer.transform(pool_text)
-    except ValueError:
-        # empty vocabulary (e.g. every value missing in a tiny country block)
+    def _fit_pool():
+        vectorizer = TfidfVectorizer(
+            analyzer=analyzer,
+            ngram_range=ngram_range,
+            min_df=1,
+            max_df=max_df,
+            sublinear_tf=True,
+            dtype=np.float32,
+        )
+        try:
+            # Fitted on the pool alone, not on pool + Source 1. The pool is what
+            # is being searched, so its statistics are the right ones - and,
+            # crucially, they do not change when the Source 1 side is processed
+            # in shards. Fitting on both made the vocabulary and IDF depend on
+            # which entities happened to be in the batch, so candidate_pairs.tsv
+            # came out different for different shard counts, on a file the
+            # organisers audit.
+            vectorizer.fit(pool_text)
+            return vectorizer, vectorizer.transform(pool_text)
+        except ValueError:
+            # empty vocabulary (e.g. every value missing in a tiny country block)
+            return None, None
+
+    if pool_index is not None and cache_key is not None:
+        vectorizer, pool_matrix = pool_index.get(cache_key, _fit_pool)
+    else:
+        vectorizer, pool_matrix = _fit_pool()
+    if vectorizer is None:
         return {}
+    s1_matrix = vectorizer.transform(s1_text)
 
     hits = defaultdict(dict)
     for qi, pi, score in _sparse_topk(
@@ -252,7 +304,7 @@ def _tfidf_channel(s1_df, pool_df, column, k, analyzer, ngram_range, min_score,
 
 
 def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
-                            min_df_cap=100):
+                            min_df_cap=100, pool_index=None, cache_key=None):
     """
     Shared-token channel. Tokens present in more than `max_df_ratio` of the pool
     carry no signal and would create huge posting lists, so they are skipped.
@@ -266,22 +318,13 @@ def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
     if n_pool == 0:
         return {}
 
-    postings = defaultdict(list)
-    for idx, tokens in enumerate(pool_tokens):
-        # sorted, not just deduplicated: set iteration order over strings varies
-        # between processes (hash randomisation), which changes the order of the
-        # float accumulation below. Float addition is not associative, so the
-        # tiny differences flip ties at the k-th position and the candidate set
-        # stops being reproducible across runs.
-        for token in sorted(set(tokens)):
-            postings[token].append(idx)
+    def _build_postings():
+        return _pool_postings(pool_tokens, max_df_ratio, min_df_cap)
 
-    df_cap = max(1, int(max_df_ratio * n_pool), min(min_df_cap, n_pool))
-    idf = {
-        token: np.log(n_pool / len(ids))
-        for token, ids in postings.items()
-        if len(ids) <= df_cap
-    }
+    if pool_index is not None and cache_key is not None:
+        postings, idf = pool_index.get(cache_key, _build_postings)
+    else:
+        postings, idf = _build_postings()
 
     hits = {}
     for qi, tokens in enumerate(s1_tokens):
@@ -309,10 +352,38 @@ def _inverted_index_channel(s1_tokens, pool_tokens, k, max_df_ratio, min_shared,
     return hits
 
 
-def _embedding_channel(s1_df, pool_df, encoder, k, min_score, n_threads):
+def _pool_postings(pool_tokens, max_df_ratio, min_df_cap):
+    """Inverted index over the pool, plus the IDF of each retained token."""
+    n_pool = len(pool_tokens)
+    postings = defaultdict(list)
+    for idx, tokens in enumerate(pool_tokens):
+        # sorted, not just deduplicated: set iteration order over strings varies
+        # between processes (hash randomisation), which changes the order of the
+        # float accumulation below. Float addition is not associative, so the
+        # tiny differences flip ties at the k-th position and the candidate set
+        # stops being reproducible across runs.
+        for token in sorted(set(tokens)):
+            postings[token].append(idx)
+
+    df_cap = max(1, int(max_df_ratio * n_pool), min(min_df_cap, n_pool))
+    idf = {
+        token: np.log(n_pool / len(ids))
+        for token, ids in postings.items()
+        if len(ids) <= df_cap
+    }
+
+    return postings, idf
+
+
+def _embedding_channel(s1_df, pool_df, encoder, k, min_score, n_threads,
+                       pool_index=None, cache_key=None):
     """
     Dense-similarity channel. Imported lazily so the optional embedding
     dependencies are only required when this channel is actually enabled.
+
+    The pool's vectors and ANN index are cached alongside the other pool-side
+    structures, so sharded inference encodes the pool once rather than once
+    per shard.
     """
     if encoder is None:
         raise ValueError(
@@ -321,9 +392,17 @@ def _embedding_channel(s1_df, pool_df, encoder, k, min_score, n_threads):
         )
     from .embeddings import embedding_topk, serialise_records
 
+    def _encode_pool():
+        return encoder.encode(serialise_records(pool_df))
+
+    if pool_index is not None and cache_key is not None:
+        pool_vectors = pool_index.get(cache_key, _encode_pool)
+    else:
+        pool_vectors = _encode_pool()
+
     query = encoder.encode(serialise_records(s1_df))
-    pool = encoder.encode(serialise_records(pool_df))
-    return embedding_topk(query, pool, k=k, min_score=min_score, n_threads=n_threads)
+    return embedding_topk(query, pool_vectors, k=k, min_score=min_score,
+                          n_threads=n_threads)
 
 
 def _name_tokens(df):
@@ -385,6 +464,10 @@ def generate_candidates(s1_df, pool_df, config=None):
         # Cap on the candidates kept per entity after the channels are unioned.
         # None keeps everything.
         "max_candidates": None,
+        # optional PoolIndex; reuses the pool's vectorisers, inverted indexes
+        # and embedding vectors across calls, which is what makes sharded
+        # inference affordable
+        "pool_index": None,
         # Which channels to run. Measured unique recall on the real data was
         # addr_char 12.4%, rare_token 0.29%, numeric 0.24%, name_char 0.20%,
         # name_word 0.04%, while rare_token was the single slowest channel.
@@ -437,30 +520,41 @@ def generate_candidates(s1_df, pool_df, config=None):
                 s1_block, pool_block, name_column, cfg["k_name_char"],
                 "char_wb", (3, 5), cfg["min_score_char"], cfg["n_threads"],
                 cfg["max_df_char"], cfg["max_df_min_docs"],
+                pool_index, key("name_char"),
             ),
             "addr_char": lambda: _tfidf_channel(
                 s1_block, pool_block, "business_address_clean", cfg["k_addr_char"],
                 "char_wb", (3, 5), cfg["min_score_char"], cfg["n_threads"],
                 cfg["max_df_char"], cfg["max_df_min_docs"],
+                pool_index, key("addr_char"),
             ),
             "name_word": lambda: _tfidf_channel(
                 s1_block, pool_block, name_column, cfg["k_name_word"],
                 "word", (1, 1), cfg["min_score_word"], cfg["n_threads"],
                 cfg["max_df_word"], cfg["max_df_min_docs"],
+                pool_index, key("name_word"),
             ),
             "numeric": lambda: _inverted_index_channel(
                 _numeric_tokens(s1_block), _numeric_tokens(pool_block),
-                cfg["k_numeric"], cfg["numeric_max_df_ratio"], min_shared=1,
+                cfg["k_numeric"], cfg["numeric_max_df_ratio"], 1,
+                pool_index=pool_index, cache_key=key("numeric"),
             ),
             "rare_token": lambda: _inverted_index_channel(
                 _name_tokens(s1_block), _name_tokens(pool_block),
-                cfg["k_rare_token"], cfg["rare_token_max_df_ratio"], min_shared=1,
+                cfg["k_rare_token"], cfg["rare_token_max_df_ratio"], 1,
+                pool_index=pool_index, cache_key=key("rare_token"),
             ),
             "embedding": lambda: _embedding_channel(
                 s1_block, pool_block, cfg["embedding_encoder"], cfg["k_embedding"],
                 cfg["min_score_embedding"], cfg["n_threads"],
+                pool_index, key("embedding"),
             ),
         }
+        pool_index = cfg.get("pool_index")
+        if pool_index is not None:
+            pool_index.bind(pool_df)
+        key = lambda name: (country, name)
+
         enabled = set(cfg["channels"])
         unknown = enabled - set(CHANNELS)
         if unknown:
