@@ -111,7 +111,11 @@ def main():
         from sagemaker.processing import ProcessingInput, ProcessingOutput
         from sagemaker.sklearn.processing import SKLearnProcessor
     except ImportError as error:
-        sys.exit(f"missing dependency: {error}\n\n  pip install 'sagemaker>=2.200' boto3")
+        sys.exit(
+            f"missing or incompatible dependency: {error}\n\n"
+            "  use the project interpreter and SageMaker SDK v2:\n"
+            "  .venv/bin/python -m pip install 'sagemaker>=2.200,<3' boto3"
+        )
 
     session = sagemaker.Session(boto3.Session(region_name=args.region)) \
         if args.region else sagemaker.Session()
