@@ -873,6 +873,41 @@ def test_max_df_guard_on_small_blocks():
     print("  max_df small-block guard OK")
 
 
+def test_pool_index_reuse_is_exact_and_guarded():
+    """
+    Sharded inference blocks every shard against the whole pool, so the pool's
+    vectorisers and inverted indexes must be built once and reused. Reuse has
+    to be exact - a cache serving vectors fitted on a different pool would be
+    silently wrong rather than slow.
+    """
+    from src.matching.blocking import PoolIndex, generate_candidates
+
+    s1, pool = _toy_frames()
+    whole = generate_candidates(s1, pool)
+
+    index = PoolIndex()
+    sharded = {}
+    for start in range(len(s1)):
+        piece = s1.iloc[start:start + 1].reset_index(drop=True)
+        sharded.update(generate_candidates(piece, pool, {"pool_index": index}))
+
+    assert set(whole) == set(sharded)
+    for entity_id in whole:
+        assert set(whole[entity_id]) == set(sharded[entity_id]), (
+            f"{entity_id}: cached pool structures changed the candidates"
+        )
+    assert len(index) > 0, "nothing was cached"
+
+    # a PoolIndex bound to one pool must refuse another
+    other = pool.iloc[:1].reset_index(drop=True)
+    try:
+        generate_candidates(s1, other, {"pool_index": index})
+        raise AssertionError("reusing a PoolIndex across pools should be refused")
+    except ValueError:
+        pass
+    print("  pool index reuse is exact and guarded OK")
+
+
 def test_split_is_entity_level_and_stratified():
     gt = {f"S1-{i}": (set() if i % 3 == 0 else {f"S2-{i}"}) for i in range(60)}
     country_of = {f"S1-{i}": ("India" if i % 2 else "US") for i in range(60)}
@@ -929,6 +964,7 @@ def main():
     test_channel_pruning_and_zero_idf_guard()
     test_blocking_is_reproducible_across_processes()
     test_blocking_is_shard_invariant()
+    test_pool_index_reuse_is_exact_and_guarded()
     test_prelim_score_is_not_saturated_by_one_channel()
     test_prune_candidates_keeps_each_channels_best()
     test_max_df_guard_on_small_blocks()

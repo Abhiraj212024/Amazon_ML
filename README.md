@@ -544,6 +544,11 @@ entity, 150k entities is already ~13M training rows, far past where more helps
 a 39-feature GBDT. `--max-fit-entities` bounds memory regardless of input size,
 and only the entities actually used are blocked.
 
+The pool's vectorisers, inverted indexes and embedding vectors are built once
+into a `PoolIndex` and reused by every shard. Without it each shard rebuilds
+them: measured at ten shards that was 2.6x the unsharded cost, and it grows
+with the shard count. With it, 1.13x.
+
 **Inference cannot be subsampled** - every test Source 1 entity must appear in
 the submission - so it is sharded instead. Each shard is blocked against the
 *whole* pool (sharding the pool would lose candidates), peak memory is set by
