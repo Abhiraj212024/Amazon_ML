@@ -44,3 +44,7 @@ Thumbs.db
 
 # Synthetic smoke-test data
 dataset_synthetic/
+
+# Cloud deployment artefacts
+dist/
+cloud_output/

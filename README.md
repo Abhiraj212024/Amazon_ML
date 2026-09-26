@@ -457,6 +457,32 @@ analysis, solution strategy and conclusion are judgement rather than
 measurement, and inventing them would put unverified claims in a document the
 organisers review. The team member list is left blank too.
 
+## Running on AWS SageMaker
+
+The full test set does not fit on a laptop: the pool's TF-IDF matrices,
+dataframe and record views need roughly 25 GB resident, so a local run is
+killed however many shards it is split into. `deploy/` holds everything needed
+to run it on SageMaker, and **`deploy/README.md` is a step-by-step runbook for
+someone who has never used AWS** - account, IAM user, execution role, CLI,
+bucket, upload, run, download.
+
+```bash
+# prove the path and measure one shard first
+python3 deploy/sagemaker_run.py --bucket <bucket> --role-arn <arn> \
+    --team-name <team> --mode smoke --wait
+
+# then the real run, sized from that measurement
+python3 deploy/sagemaker_run.py --bucket <bucket> --role-arn <arn> \
+    --team-name <team> --mode full --shards 40 --wait
+```
+
+AWS never reaches into your machine: the dataset is uploaded to S3 once, the
+job reads from there and writes results back, and you download them.
+
+`deploy/entrypoint.sh` takes its paths from the environment, so the identical
+cloud path runs locally for debugging - which is how it was verified before any
+job was launched.
+
 ## One command for a full submission run
 
 ```bash
