@@ -165,10 +165,24 @@ python3 scripts/tune_blocking.py --train-dir dataset_5pct/train
 
 Sweeps channel sets, per-channel `k`, `max_df` and a post-union cap, and prints
 recall against candidates per entity, plus the smallest candidate set that
-clears each recall floor. `--max-candidates N` then applies the chosen cap;
-because that cut happens before the model runs, the result is still exactly
-"the set the model runs inference over", which is what `candidate_pairs.tsv`
-is defined to be.
+clears each recall floor.
+
+**Prefer `--k-per-channel` over `--max-candidates`.** Lowering each channel's
+own top-k shrinks the union while every channel keeps its own best hits by
+construction. A post-union cap has to re-rank candidates whose per-channel
+scores are not comparable, and can silently delete the pairs a channel finds
+*alone* - which is the entire reason that channel is in the union.
+
+That failure is not hypothetical. Ranking the cap by number-of-channels-first
+kept only 5.5% of single-channel true pairs at a cap of 25; because `addr_char`
+contributes 12.4% *unique* recall, blocking recall fell 0.9816 -> 0.8592 and
+macro F_0.5 fell 0.9614 -> 0.9155. Selection is now round-robin across channels,
+which keeps 60% of those pairs at the same cap - better, but still a real cost.
+Measure before capping.
+
+Both cuts happen before the model runs, so the result is still exactly "the set
+the model runs inference over", which is what `candidate_pairs.tsv` is defined
+to be.
 
 ### What the cost actually is
 

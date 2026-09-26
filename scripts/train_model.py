@@ -93,6 +93,8 @@ def main():
     parser.add_argument("--conflict-stage", default="post", choices=("none", "pre", "post"))
     parser.add_argument("--channels", default=None)
     parser.add_argument("--max-k", type=int, default=10)
+    parser.add_argument("--k-per-channel", type=int, default=0,
+                        help="top-k each blocking channel keeps (0 = default 25). Lowering this shrinks the union while each channel keeps its OWN best hits, which post-union pruning cannot guarantee.")
     parser.add_argument("--max-candidates", type=int, default=0,
                         help="cap candidates per entity after the union (0 = no cap)")
     parser.add_argument("--max-df-char", type=float, default=1.0)
@@ -163,6 +165,11 @@ def main():
                        "embedding_encoder": encoder,
                        "max_candidates": args.max_candidates,
                        "max_df_char": args.max_df_char}
+    if args.k_per_channel:
+        for _key in ("k_name_char", "k_addr_char", "k_name_word",
+                     "k_numeric", "k_rare_token", "k_embedding"):
+            blocking_config[_key] = args.k_per_channel
+
 
     # Only the entities actually used are blocked: blocking the full training
     # Source 1 would dominate the runtime for rows the model never sees.

@@ -819,30 +819,47 @@ def test_prelim_score_is_not_saturated_by_one_channel():
     print("  prelim score rewards channel agreement OK")
 
 
-def test_prune_candidates():
-    """Pruning must keep the strongest candidates and be order-independent."""
+def test_prune_candidates_keeps_each_channels_best():
+    """
+    Pruning must not delete the pairs a channel finds ALONE. Ranking by the
+    number of channels first did exactly that: on the real data it kept 5.5%
+    of single-channel true pairs at a cap of 25, and since addr_char
+    contributed 12.4% unique recall, blocking recall fell 0.9816 -> 0.8592.
+
+    Round-robin selection gives every channel a turn, so its own top hit
+    survives regardless of whether anything else found it.
+    """
     from src.matching.blocking import prune_candidates
 
     candidates = {
         "S1-1": {
-            "keep-a": {"name_char": 0.9, "addr_char": 0.8},   # two channels
-            "keep-b": {"name_char": 0.7, "addr_char": 0.7},   # two channels
-            "drop-a": {"rare_token": 1.0},                    # one saturated hit
-            "drop-b": {"numeric": 1.0},
+            # found by two channels, but weakly
+            "pair-a": {"name_char": 0.30, "name_word": 0.30},
+            "pair-b": {"name_char": 0.25, "name_word": 0.25},
+            # addr_char's own best, found by nothing else - must survive
+            "addr-best": {"addr_char": 0.95},
+            "addr-second": {"addr_char": 0.90},
         },
         "S1-2": {"only": {"name_char": 0.5}},
     }
     pruned = prune_candidates(candidates, 2)
-    assert set(pruned["S1-1"]) == {"keep-a", "keep-b"}, pruned["S1-1"]
+    assert "addr-best" in pruned["S1-1"], (
+        f"a channel's own top hit was pruned: {sorted(pruned['S1-1'])}"
+    )
+    assert len(pruned["S1-1"]) == 2
     assert set(pruned["S1-2"]) == {"only"}, "entities under the cap are untouched"
 
-    # the cap must not depend on insertion order
+    # every channel present keeps at least its best when the cap allows
+    wide = prune_candidates(candidates, 3)
+    assert "addr-best" in wide["S1-1"] and "pair-a" in wide["S1-1"]
+
+    # the result must not depend on insertion order
     reordered = {"S1-1": dict(reversed(list(candidates["S1-1"].items())))}
-    assert set(prune_candidates(reordered, 2)["S1-1"]) == {"keep-a", "keep-b"}
+    assert set(prune_candidates(reordered, 2)["S1-1"]) == set(pruned["S1-1"])
 
     assert prune_candidates(candidates, 0) == candidates, "0 means no cap"
     assert prune_candidates(candidates, None) == candidates
-    print("  candidate pruning OK")
+    print("  candidate pruning keeps each channel's best OK")
 
 
 def test_max_df_guard_on_small_blocks():
@@ -913,7 +930,7 @@ def main():
     test_blocking_is_reproducible_across_processes()
     test_blocking_is_shard_invariant()
     test_prelim_score_is_not_saturated_by_one_channel()
-    test_prune_candidates()
+    test_prune_candidates_keeps_each_channels_best()
     test_max_df_guard_on_small_blocks()
     test_documentation_template_filling()
     test_embedding_channel_and_cosines()
