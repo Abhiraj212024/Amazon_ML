@@ -25,7 +25,7 @@ your Mac  <--download--  S3 bucket
 
 ### 1. An AWS account
 
-Sign up at <https://aws.amazon.com/>. A card is required. Set a **billing
+Sign up at [https://aws.amazon.com/](https://aws.amazon.com/). A card is required. Set a **billing
 alert** immediately — Billing → Budgets → Create budget → a small monthly cap
 with an email alert. Do this before launching anything.
 
@@ -79,7 +79,7 @@ Bucket names are globally unique, so add something of your own:
 
 ```bash
 aws s3 mb s3://business-er-<yourname> --region us-east-1
-pip install 'sagemaker>=2.200' boto3
+.venv/bin/python -m pip install 'sagemaker>=2.200,<3' boto3
 ```
 
 ---
@@ -113,7 +113,7 @@ prints a projection for the whole run — so the full job is sized from a
 measurement rather than a guess, and any mistake costs minutes.
 
 ```bash
-python3 deploy/sagemaker_run.py \
+.venv/bin/python deploy/sagemaker_run.py \
     --bucket business-er-<yourname> \
     --role-arn arn:aws:iam::123456789012:role/service-role/AmazonSageMaker-... \
     --team-name your_team \
@@ -133,7 +133,7 @@ Look for:
 ### Then: the full run
 
 ```bash
-python3 deploy/sagemaker_run.py \
+.venv/bin/python deploy/sagemaker_run.py \
     --bucket business-er-<yourname> \
     --role-arn arn:... \
     --team-name your_team \
@@ -157,11 +157,11 @@ log and metric.
 `ml.r5.4xlarge` (16 vCPU, **128 GB**) is the default, and the memory is the
 reason. Measured/derived at full scale:
 
-| | |
-| --- | --- |
-| TF-IDF pool matrices | ~11 GB |
-| pool dataframe | ~5 GB |
-| per-shard record views | scales with `--shards` |
+|                        |                         |
+| ---------------------- | ----------------------- |
+| TF-IDF pool matrices   | ~11 GB                  |
+| pool dataframe         | ~5 GB                   |
+| per-shard record views | scales with`--shards` |
 
 A compute-optimised `c5` of the same price has a quarter of the memory and will
 die the same way your laptop did. If the smoke run reports plenty of headroom,
@@ -175,13 +175,13 @@ current rates on the SageMaker pricing page before launching — and keep
 
 ## If something goes wrong
 
-| Symptom | Cause |
-| --- | --- |
-| `AccessDenied` on S3 | the execution role lacks bucket access — attach **AmazonS3FullAccess** to the *role* from step 3, not just the user |
-| `ResourceLimitExceeded` | your account has no quota for that instance type; request an increase in Service Quotas, or try a smaller one |
-| job fails in "Data consistency" | the uploaded training data is not label-consistent; fix it locally with `scripts/make_subsample.py` before re-uploading |
-| killed / out of memory | raise `--shards`, then move to a larger `r5` |
-| a shard failed mid-run | just re-run; finished shards are on the job's volume only, so prefer `--shards` small enough that a rerun is cheap |
+| Symptom                         | Cause                                                                                                                       |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `AccessDenied` on S3          | the execution role lacks bucket access — attach**AmazonS3FullAccess** to the *role* from step 3, not just the user |
+| `ResourceLimitExceeded`       | your account has no quota for that instance type; request an increase in Service Quotas, or try a smaller one               |
+| job fails in "Data consistency" | the uploaded training data is not label-consistent; fix it locally with`scripts/make_subsample.py` before re-uploading    |
+| killed / out of memory          | raise`--shards`, then move to a larger `r5`                                                                             |
+| a shard failed mid-run          | just re-run; finished shards are on the job's volume only, so prefer`--shards` small enough that a rerun is cheap         |
 
 Every log is in `reports/` in the output, and also in CloudWatch via the
 console link the launcher prints.

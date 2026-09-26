@@ -54,19 +54,38 @@ from src.preprocessing.pipeline import preprocess_dataframe
 logger = logging.getLogger("train_model")
 
 
+_NEEDED_COLUMNS = (
+    "entity_id", "country_clean", "business_name_clean", "business_name_core",
+    "business_address_clean", "address_numbers",
+)
+
+
+def _load_single(data_dir, prefix, source):
+    parquet = os.path.join(data_dir, f"{prefix}_{source}_processed.parquet")
+    tsv = os.path.join(data_dir, f"{prefix}_{source}.tsv")
+    started = time.time()
+    if os.path.exists(parquet):
+        df = pd.read_parquet(parquet)
+    elif os.path.exists(tsv):
+        df = preprocess_dataframe(pd.read_csv(tsv, sep="\t", dtype=str))
+    else:
+        raise FileNotFoundError(f"neither {parquet} nor {tsv} exists")
+    cols = [c for c in _NEEDED_COLUMNS if c in df.columns]
+    df = df[cols]
+    logger.info("loaded %s | rows=%d cols=%d | %.1fs", source, len(df), len(cols),
+                time.time() - started)
+    return df
+
+
 def _load_sources(data_dir, prefix):
-    frames = {}
-    for source in ("source1", "source2", "source3"):
-        parquet = os.path.join(data_dir, f"{prefix}_{source}_processed.parquet")
-        tsv = os.path.join(data_dir, f"{prefix}_{source}.tsv")
-        if os.path.exists(parquet):
-            frames[source] = pd.read_parquet(parquet)
-        elif os.path.exists(tsv):
-            frames[source] = preprocess_dataframe(pd.read_csv(tsv, sep="\t", dtype=str))
-        else:
-            raise FileNotFoundError(f"neither {parquet} nor {tsv} exists")
-    pool = pd.concat([frames["source2"], frames["source3"]], ignore_index=True)
-    return frames["source1"], pool
+    import gc
+    s1 = _load_single(data_dir, prefix, "source1")
+    s2 = _load_single(data_dir, prefix, "source2")
+    s3 = _load_single(data_dir, prefix, "source3")
+    pool = pd.concat([s2, s3], ignore_index=True)
+    del s2, s3
+    gc.collect()
+    return s1, pool
 
 
 def _tokens(df, column):
