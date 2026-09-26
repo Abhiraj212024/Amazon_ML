@@ -65,11 +65,13 @@ def _load_single(data_dir, prefix, source):
     tsv = os.path.join(data_dir, f"{prefix}_{source}.tsv")
     started = time.time()
     if os.path.exists(parquet):
+        logger.info("loading %s from %s...", source, os.path.basename(parquet))
         df = pd.read_parquet(parquet)
     elif os.path.exists(tsv):
+        logger.info("reading %s from %s and preprocessing...", source, os.path.basename(tsv))
         df = preprocess_dataframe(pd.read_csv(tsv, sep="\t", dtype=str))
     else:
-        raise FileNotFoundError(f"neither {parquet} nor {tsv} exists")
+        raise FileNotFoundError(f"neither {parquet} nor {tsv} exists in {data_dir}")
     cols = [c for c in _NEEDED_COLUMNS if c in df.columns]
     df = df[cols]
     logger.info("loaded %s | rows=%d cols=%d | %.1fs", source, len(df), len(cols),
@@ -125,7 +127,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        stream=sys.stdout, force=True)
     started = time.time()
     report = {}
     rng = np.random.default_rng(args.seed)
