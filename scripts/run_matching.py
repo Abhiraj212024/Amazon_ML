@@ -208,6 +208,8 @@ def main():
                              "recall: addr_char 12.4%%, rare_token 0.29%%, numeric 0.24%%, "
                              "name_char 0.20%%, name_word 0.04%%. Pruning the cheap ones "
                              "buys back most of the blocking time.")
+    parser.add_argument("--k-per-channel", type=int, default=0,
+                        help="top-k each blocking channel keeps (0 = default 25). Lowering this shrinks the union while each channel keeps its OWN best hits, which post-union pruning cannot guarantee.")
     parser.add_argument("--max-candidates", type=int, default=0,
                         help="cap candidates kept per Source 1 entity after the channels "
                              "are unioned (0 = no cap). Smaller candidate sets are ranked "
@@ -315,6 +317,11 @@ def main():
         "max_candidates": args.max_candidates,
         "max_df_char": args.max_df_char,
     }
+    if args.k_per_channel:
+        for _key in ("k_name_char", "k_addr_char", "k_name_word",
+                     "k_numeric", "k_rare_token", "k_embedding"):
+            blocking_config[_key] = args.k_per_channel
+
     report["blocking_config"] = {"channels": channels, "embeddings": bool(args.embeddings)}
     logger.info("blocking channels: %s", ", ".join(channels))
     candidates = generate_candidates_cached(

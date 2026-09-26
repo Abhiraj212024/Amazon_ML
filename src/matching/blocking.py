@@ -74,16 +74,22 @@ def prelim_score(channel_scores):
 
 def _prune_key(channel_scores, candidate_id):
     """
-    Ordering used when cutting a candidate list down.
+    Fallback ordering, used only for candidates a round-robin pass did not
+    already claim. Ties broken by candidate id so the result never depends on
+    dict ordering.
 
-    Number of channels first: a pair several independent channels agree on is
-    far likelier to be a true match than one a single channel scored highly.
-    Ties broken by candidate id so the result never depends on dict ordering.
+    Note what this deliberately does NOT do: rank by the number of channels
+    first. That looks reasonable - several channels agreeing is good evidence -
+    but it sorts every single-channel hit below every two-channel one, however
+    weak. On the real data addr_char alone contributed 12.4% *unique* recall,
+    which is exactly the population that ordering discards: capping at 25 took
+    blocking recall from 0.9816 to 0.8592, and 98.5% of that loss matches
+    addr_char's unique contribution.
     """
-    return (len(channel_scores), prelim_score(channel_scores), str(candidate_id))
+    return (prelim_score(channel_scores), str(candidate_id))
 
 
-def prune_candidates(candidates, max_per_entity):
+def prune_candidates(candidates, max_per_entity, channel_order=None):
     """
     Keep only the best `max_per_entity` candidates for each Source 1 entity.
 
@@ -92,25 +98,64 @@ def prune_candidates(candidates, max_per_entity):
     featurising plus scoring is linear in candidates per entity, so it is the
     dominant cost once blocking is cached.
 
-    Ranking by the cheap combined score and cutting is a real filtering stage,
-    and the result is still "the exact set the model runs inference over",
-    which is what candidate_pairs.tsv is defined to be.
+    Selection is round-robin across channels rather than by one global score.
+    Each channel proposes its own best remaining candidate in turn, so a
+    channel's top hits survive the cut even when no other channel found them.
+    That matters because the channels earn their place through what they find
+    *alone*: a single global ranking quietly deletes exactly those pairs, and
+    with it the reason for having several channels.
 
-    Ties are broken by candidate id so the result does not depend on dict
-    ordering.
+    Channels are visited in `channel_order` - by default the order of
+    CHANNELS - so the result does not depend on dict ordering, and ties within
+    a channel are broken by candidate id.
+
+    The cut happens before the model scores anything, so the result is still
+    "the exact set the model runs inference over", which is what
+    candidate_pairs.tsv is defined to be.
     """
     if not max_per_entity or max_per_entity <= 0:
         return candidates
 
+    order = list(channel_order or CHANNELS)
     pruned = {}
+
     for s1_id, matches in candidates.items():
         if len(matches) <= max_per_entity:
             pruned[s1_id] = matches
             continue
-        ranked = sorted(
-            matches.items(), key=lambda item: _prune_key(item[1], item[0]), reverse=True
-        )
-        pruned[s1_id] = dict(ranked[:max_per_entity])
+
+        # each channel's own candidates, best first
+        per_channel = {}
+        for channel in order:
+            ranked = sorted(
+                ((cand_id, scores[channel]) for cand_id, scores in matches.items()
+                 if channel in scores),
+                key=lambda item: (-item[1], str(item[0])),
+            )
+            if ranked:
+                per_channel[channel] = [cand_id for cand_id, _ in ranked]
+
+        kept, cursors = [], {channel: 0 for channel in per_channel}
+        seen = set()
+        while len(kept) < max_per_entity:
+            progressed = False
+            for channel in order:
+                if channel not in per_channel or len(kept) >= max_per_entity:
+                    continue
+                queue, index = per_channel[channel], cursors[channel]
+                while index < len(queue) and queue[index] in seen:
+                    index += 1
+                cursors[channel] = index
+                if index < len(queue):
+                    cand_id = queue[index]
+                    kept.append(cand_id)
+                    seen.add(cand_id)
+                    cursors[channel] = index + 1
+                    progressed = True
+            if not progressed:
+                break
+
+        pruned[s1_id] = {cand_id: matches[cand_id] for cand_id in kept}
     return pruned
 
 
