@@ -127,7 +127,6 @@ def main():
         blocking_config["embedding_encoder"] = encoder
 
     s1_df, pool_df = _load_sources(args.test_dir, args.prefix)
-    pool_views = build_record_views(pool_df)
     entity_ids = s1_df["entity_id"].astype(str).tolist()
 
     pool_embedding = None
@@ -172,6 +171,12 @@ def main():
         # drop candidates that only that part of the pool contains
         candidates = generate_candidates(shard_df, pool_df, blocking_config)
 
+        # Views are built only for the candidates this shard actually produced.
+        # One per pool record costs about a kilobyte, so materialising the whole
+        # pool runs to gigabytes and was the largest avoidable allocation in the
+        # run - it is what made this OOM on a laptop regardless of shard count.
+        needed = {cand_id for matches in candidates.values() for cand_id in matches}
+        pool_views = build_record_views(pool_df, only=needed)
         shard_views = build_record_views(shard_df)
         embedding = None
         if encoder is not None:
@@ -219,9 +224,11 @@ def main():
 
         done += 1
         logger.info(
-            "shard %d/%d | entities=%d pairs=%d | %.1fs",
-            index + 1, len(bounds), stop - start, len(X), time.time() - shard_started,
+            "shard %d/%d | entities=%d candidates=%d pool_views=%d pairs=%d | %.1fs",
+            index + 1, len(bounds), stop - start, len(needed), len(pool_views),
+            len(X), time.time() - shard_started,
         )
+        del pool_views, shard_views, X, pair_index, candidates
 
     if wanted is not None:
         logger.info("finished the requested shards; re-run without --only-shards to merge")

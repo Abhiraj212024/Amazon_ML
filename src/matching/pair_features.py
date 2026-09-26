@@ -108,14 +108,31 @@ class RecordView:
         self.addr_missing = not self.addr
 
 
-def build_record_views(df):
-    """entity_id -> RecordView for every row of a preprocessed frame."""
-    columns = [
-        c for c in ("business_name_clean", "business_name_core", "business_address_clean",
-                    "country_clean", "address_numbers") if c in df.columns
-    ]
-    records = df[["entity_id"] + columns].to_dict("records")
-    return {r["entity_id"]: RecordView(r) for r in records}
+_VIEW_COLUMNS = ("business_name_clean", "business_name_core", "business_address_clean",
+                 "country_clean", "address_numbers")
+
+
+def build_record_views(df, only=None):
+    """
+    entity_id -> RecordView for the rows of a preprocessed frame.
+
+    `only` restricts the build to a set of entity ids. That matters on the pool
+    side during sharded inference: a RecordView holds several Python sets and
+    costs roughly a kilobyte, so materialising one for every record of a
+    multi-million-row pool runs to gigabytes, while a shard only ever compares
+    against the candidates its own blocking produced.
+    """
+    columns = [c for c in _VIEW_COLUMNS if c in df.columns]
+    frame = df[["entity_id"] + columns]
+
+    if only is not None:
+        wanted = only if isinstance(only, (set, frozenset)) else set(only)
+        if not wanted:
+            return {}
+        frame = frame[frame["entity_id"].astype(str).isin(wanted)]
+
+    records = frame.to_dict("records")
+    return {str(r["entity_id"]): RecordView(r) for r in records}
 
 
 def _pair_features(s1, cand, channel_scores, context, name_idf, addr_idf):
