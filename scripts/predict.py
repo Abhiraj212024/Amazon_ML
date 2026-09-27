@@ -129,6 +129,10 @@ def main():
                         help="top-k each blocking channel keeps (default: 15)")
     parser.add_argument("--max-df-char", type=float, default=0.1,
                         help="drop char n-grams appearing in > this share of pool (default: 0.1)")
+    parser.add_argument("--min-score-char", type=float, default=None,
+                        help="minimum cosine threshold for char n-gram blocking (e.g. 0.25)")
+    parser.add_argument("--fast", action="store_true",
+                        help="fast inference preset (max_df_char=0.03, min_score_char=0.25, k_per_channel=12, max_candidates=25)")
     parser.add_argument("--embeddings", action="store_true",
                         help="enable dense embedding reranking for embed_cosine feature")
     parser.add_argument("--embedding-model", default=None)
@@ -156,19 +160,31 @@ def main():
             channels = ["addr_char", "name_char", "name_word"]
         blocking_config["channels"] = channels
 
-    if args.max_df_char is not None:
+    if args.fast:
+        blocking_config["max_df_char"] = 0.03
+        blocking_config["min_score_char"] = 0.25
+        blocking_config["max_candidates"] = 25
+        for _key in ("k_name_char", "k_addr_char", "k_name_word",
+                     "k_numeric", "k_rare_token", "k_embedding"):
+            blocking_config[_key] = 12
+
+    if args.max_df_char is not None and not args.fast:
         blocking_config["max_df_char"] = args.max_df_char
 
-    if args.max_candidates:
+    if args.min_score_char is not None:
+        blocking_config["min_score_char"] = args.min_score_char
+
+    if args.max_candidates and not args.fast:
         blocking_config["max_candidates"] = args.max_candidates
 
-    if args.k_per_channel:
+    if args.k_per_channel and not args.fast:
         for _key in ("k_name_char", "k_addr_char", "k_name_word",
                      "k_numeric", "k_rare_token", "k_embedding"):
             blocking_config[_key] = args.k_per_channel
 
-    logger.info("channels: %s (max_df=%.2f) | strategy: %s | conflict: %s",
+    logger.info("channels: %s (max_df=%.3f, min_score=%.2f) | strategy: %s | conflict: %s",
                 ", ".join(channels), blocking_config.get("max_df_char", 1.0),
+                blocking_config.get("min_score_char", 0.15),
                 bundle["strategy"], bundle["conflict_stage"])
 
     use_embeddings = args.embeddings or bool(bundle["extra"].get("embedding_model"))
