@@ -214,7 +214,15 @@ def build_pair_table(candidates, s1_views, pool_views, name_idf, addr_idf,
         and pair_index is a DataFrame with columns s1_entity_id / candidate_entity_id
         aligned row-for-row with X.
     """
-    rows, s1_col, cand_col = [], [], []
+    n_estimated = sum(len(matches) for matches in candidates.values())
+    if n_estimated == 0:
+        empty = pd.DataFrame({"s1_entity_id": [], "candidate_entity_id": []})
+        return np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32), empty
+
+    X = np.empty((n_estimated, len(FEATURE_NAMES)), dtype=np.float32)
+    s1_col = [None] * n_estimated
+    cand_col = [None] * n_estimated
+    row_idx = 0
 
     for s1_id, matches in candidates.items():
         s1 = s1_views.get(s1_id)
@@ -234,15 +242,16 @@ def build_pair_table(candidates, s1_views, pool_views, name_idf, addr_idf,
             if cand is None:
                 continue
             context = (prelim, rank, top_score, n_cands, n_near_top)
-            rows.append(_pair_features(s1, cand, chans, context, name_idf, addr_idf))
-            s1_col.append(s1_id)
-            cand_col.append(cand_id)
+            X[row_idx, :] = _pair_features(s1, cand, chans, context, name_idf, addr_idf)
+            s1_col[row_idx] = s1_id
+            cand_col[row_idx] = cand_id
+            row_idx += 1
 
-    if not rows:
-        empty = pd.DataFrame({"s1_entity_id": [], "candidate_entity_id": []})
-        return np.zeros((0, len(FEATURE_NAMES)), dtype=np.float32), empty
+    if row_idx < n_estimated:
+        X = X[:row_idx]
+        s1_col = s1_col[:row_idx]
+        cand_col = cand_col[:row_idx]
 
-    X = np.asarray(rows, dtype=np.float32)
     pair_index = pd.DataFrame(
         {"s1_entity_id": s1_col, "candidate_entity_id": cand_col}
     )

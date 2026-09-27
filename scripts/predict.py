@@ -123,6 +123,10 @@ def main():
     parser.add_argument("--blocking-threads", type=int, default=-1)
     parser.add_argument("--channels", default=None,
                         help="override blocking channels (default: addr_char,name_char,name_word)")
+    parser.add_argument("--max-candidates", type=int, default=30,
+                        help="cap candidates kept per Source 1 entity (default: 30)")
+    parser.add_argument("--k-per-channel", type=int, default=15,
+                        help="top-k each blocking channel keeps (default: 15)")
     parser.add_argument("--max-df-char", type=float, default=0.1,
                         help="drop char n-grams appearing in > this share of pool (default: 0.1)")
     parser.add_argument("--embeddings", action="store_true",
@@ -154,6 +158,14 @@ def main():
 
     if args.max_df_char is not None:
         blocking_config["max_df_char"] = args.max_df_char
+
+    if args.max_candidates:
+        blocking_config["max_candidates"] = args.max_candidates
+
+    if args.k_per_channel:
+        for _key in ("k_name_char", "k_addr_char", "k_name_word",
+                     "k_numeric", "k_rare_token", "k_embedding"):
+            blocking_config[_key] = args.k_per_channel
 
     logger.info("channels: %s (max_df=%.2f) | strategy: %s | conflict: %s",
                 ", ".join(channels), blocking_config.get("max_df_char", 1.0),
