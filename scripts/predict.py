@@ -137,6 +137,8 @@ def main():
                         help="enable dense embedding reranking for embed_cosine feature")
     parser.add_argument("--embedding-model", default=None)
     parser.add_argument("--embedding-device", default=None)
+    parser.add_argument("--merge-only", action="store_true",
+                        help="skip inference and merge existing shard files directly")
     parser.add_argument("--report-file", default=None)
     args = parser.parse_args()
 
@@ -189,7 +191,7 @@ def main():
 
     use_embeddings = args.embeddings or bool(bundle["extra"].get("embedding_model"))
     encoder = None
-    if use_embeddings:
+    if use_embeddings and not args.merge_only:
         from src.matching.embeddings import DEFAULT_MODEL, build_encoder
 
         model_name = args.embedding_model or bundle["extra"].get("embedding_model") or DEFAULT_MODEL
@@ -198,40 +200,46 @@ def main():
 
     blocking_config["embedding_encoder"] = encoder if "embedding" in channels else None
 
-    s1_df, pool_df = _load_sources(args.test_dir, args.prefix)
-    entity_ids = s1_df["entity_id"].astype(str).tolist()
-
-    # built once and reused by every shard: without it the pool's vectorisers
-    # and inverted indexes are rebuilt per shard, which measured 2.6x the
-    # unsharded cost at ten shards and gets worse as shards are added
-    blocking_config["pool_index"] = PoolIndex()
-
     shard_dir = args.shard_dir or os.path.join(args.output_dir, "shards")
     os.makedirs(shard_dir, exist_ok=True)
+
+    s1_df = _load_single(args.test_dir, args.prefix, "source1")
+    entity_ids = s1_df["entity_id"].astype(str).tolist()
     bounds = _shard_bounds(len(entity_ids), args.shards)
     wanted = None
     if args.only_shards:
         wanted = {int(v) for v in args.only_shards.split(",") if v.strip()}
 
-    logger.info("%d entities in %d shards of ~%d", len(entity_ids), len(bounds),
-                bounds[0][1] - bounds[0][0] if bounds else 0)
+    pool_df = None
+    all_done = all(os.path.exists(os.path.join(shard_dir, f"shard_{i:05d}.pkl")) for i in range(len(bounds)))
+    if all_done and not args.only_shards:
+        logger.info("all %d shards already exist; skipping pool loading and jumping to merge", len(bounds))
+    elif not args.merge_only:
+        s2 = _load_single(args.test_dir, args.prefix, "source2")
+        s3 = _load_single(args.test_dir, args.prefix, "source3")
+        pool_df = pd.concat([s2, s3], ignore_index=True)
+        del s2, s3
+        import gc; gc.collect()
+        blocking_config["pool_index"] = PoolIndex()
 
-    kwargs = _strategy_kwargs(bundle)
-    done = 0
-    for index, (start, stop) in enumerate(bounds):
-        if wanted is not None and index not in wanted:
-            continue
-        path = os.path.join(shard_dir, f"shard_{index:05d}.pkl")
-        if os.path.exists(path):
-            logger.info("shard %d/%d already done, skipping", index + 1, len(bounds))
-            done += 1
-            continue
+    if pool_df is not None:
+        logger.info("%d entities in %d shards of ~%d", len(entity_ids), len(bounds),
+                    bounds[0][1] - bounds[0][0] if bounds else 0)
 
-        shard_started = time.time()
-        shard_df = s1_df.iloc[start:stop]
-        # the shard is blocked against the WHOLE pool; sharding the pool would
-        # drop candidates that only that part of the pool contains
-        candidates = generate_candidates(shard_df, pool_df, blocking_config)
+        kwargs = _strategy_kwargs(bundle)
+        done = 0
+        for index, (start, stop) in enumerate(bounds):
+            if wanted is not None and index not in wanted:
+                continue
+            path = os.path.join(shard_dir, f"shard_{index:05d}.pkl")
+            if os.path.exists(path):
+                logger.info("shard %d/%d already done, skipping", index + 1, len(bounds))
+                done += 1
+                continue
+
+            shard_started = time.time()
+            shard_df = s1_df.iloc[start:stop]
+            candidates = generate_candidates(shard_df, pool_df, blocking_config)
 
         # Views are built only for the candidates this shard actually produced.
         # One per pool record costs about a kilobyte, so materialising the whole
