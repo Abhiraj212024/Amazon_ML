@@ -90,10 +90,13 @@ def _load_sources(data_dir, prefix):
     return s1, pool
 
 
-def _tokens(df, column):
+def _tokens_iter(df, column):
     if column not in df.columns:
-        return []
-    return [t.split() for t in df[column].fillna("").astype(str)]
+        return
+    for val in df[column].dropna():
+        s = str(val).strip()
+        if s:
+            yield s.split()
 
 
 def main():
@@ -104,9 +107,9 @@ def main():
     parser.add_argument("--bundle", default="model.pkl")
     parser.add_argument("--report-file", default="reports/training.json")
     parser.add_argument("--cache-dir", default=None)
-    parser.add_argument("--max-fit-entities", type=int, default=150_000,
-                        help="cap on entities used to fit the model; bounds memory")
-    parser.add_argument("--max-tune-entities", type=int, default=50_000)
+    parser.add_argument("--max-fit-entities", type=int, default=20_000,
+                        help="cap on entities used to fit the model; bounds memory and blocking time")
+    parser.add_argument("--max-tune-entities", type=int, default=5_000)
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--tune-fraction", type=float, default=0.25)
     parser.add_argument("--strategy", default="tiered",
@@ -213,18 +216,22 @@ def main():
                 report["blocking"]["pair_recall"],
                 report["blocking"]["candidates_per_entity_mean"])
 
-    s1_views, pool_views = build_record_views(used_df), build_record_views(pool_df)
+    candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
+    logger.info("building record views for %d S1 entities and %d candidate pool records",
+                len(used_df), len(candidate_pool_ids))
+    s1_views = build_record_views(used_df)
+    pool_views = build_record_views(pool_df, only=candidate_pool_ids)
     name_column = ("business_name_core" if "business_name_core" in used_df.columns
                    else "business_name_clean")
-    name_idf = build_idf(_tokens(s1_df, name_column), _tokens(pool_df, name_column))
-    addr_idf = build_idf(_tokens(s1_df, "business_address_clean"),
-                         _tokens(pool_df, "business_address_clean"))
+    logger.info("building token IDF features...")
+    name_idf = build_idf(_tokens_iter(s1_df, name_column), _tokens_iter(pool_df, name_column))
+    addr_idf = build_idf(_tokens_iter(s1_df, "business_address_clean"),
+                         _tokens_iter(pool_df, "business_address_clean"))
 
     embedding = None
     if encoder is not None:
         from src.matching.embeddings import build_embedding_lookup
 
-        candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
         candidate_pool_df = pool_df[pool_df["entity_id"].isin(candidate_pool_ids)].reset_index(drop=True)
         logger.info("encoding %d S1 entities and %d surviving candidate pool records",
                     len(used_df), len(candidate_pool_df))

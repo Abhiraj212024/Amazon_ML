@@ -79,10 +79,13 @@ def _load_sources(data_dir, prefix):
     return frames["source1"], pool
 
 
-def _tokens(df, column):
+def _tokens_iter(df, column):
     if column not in df.columns:
-        return []
-    return [t.split() for t in df[column].fillna("").astype(str)]
+        return
+    for val in df[column].dropna():
+        s = str(val).strip()
+        if s:
+            yield s.split()
 
 
 def _featurise(candidates, s1_views, pool_views, name_idf, addr_idf, s1_ids, embedding):
@@ -344,11 +347,15 @@ def main():
 
     # --- stage B: pairwise model ------------------------------------------
     feature_started = time.time()
-    s1_views, pool_views = build_record_views(s1_df), build_record_views(pool_df)
+    candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
+    logger.info("building record views for %d S1 entities and %d candidate pool records",
+                len(s1_df), len(candidate_pool_ids))
+    s1_views = build_record_views(s1_df)
+    pool_views = build_record_views(pool_df, only=candidate_pool_ids)
     name_column = "business_name_core" if "business_name_core" in s1_df.columns else "business_name_clean"
-    name_idf = build_idf(_tokens(s1_df, name_column), _tokens(pool_df, name_column))
+    name_idf = build_idf(_tokens_iter(s1_df, name_column), _tokens_iter(pool_df, name_column))
     addr_idf = build_idf(
-        _tokens(s1_df, "business_address_clean"), _tokens(pool_df, "business_address_clean")
+        _tokens_iter(s1_df, "business_address_clean"), _tokens_iter(pool_df, "business_address_clean")
     )
     logger.info("record views and IDF features ready in %.1fs", time.time() - feature_started)
 
@@ -357,7 +364,6 @@ def main():
         from src.matching.embeddings import build_embedding_lookup
 
         started = time.time()
-        candidate_pool_ids = {cand_id for matches in candidates.values() for cand_id in matches}
         candidate_pool_df = pool_df[pool_df["entity_id"].isin(candidate_pool_ids)].reset_index(drop=True)
         logger.info("encoding %d S1 entities and %d surviving candidate pool records",
                     len(s1_df), len(candidate_pool_df))
@@ -486,13 +492,16 @@ def main():
         )
         logger.info("test candidate generation complete in %.1fs", time.time() - test_started)
 
-        test_s1_views, test_pool_views = build_record_views(test_s1), build_record_views(test_pool)
+        test_cand_ids = {cand_id for matches in test_candidates.values() for cand_id in matches}
+        logger.info("building test record views for %d S1 entities and %d candidate pool records",
+                    len(test_s1), len(test_cand_ids))
+        test_s1_views = build_record_views(test_s1)
+        test_pool_views = build_record_views(test_pool, only=test_cand_ids)
         test_ids = test_s1["entity_id"].tolist()
         test_embedding = None
         if encoder is not None:
             from src.matching.embeddings import build_embedding_lookup
 
-            test_cand_ids = {cand_id for matches in test_candidates.values() for cand_id in matches}
             test_cand_pool_df = test_pool[test_pool["entity_id"].isin(test_cand_ids)].reset_index(drop=True)
             logger.info("encoding %d test S1 entities and %d surviving test candidate pool records",
                         len(test_s1), len(test_cand_pool_df))
